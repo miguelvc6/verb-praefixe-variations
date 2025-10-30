@@ -15,8 +15,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import (Dict, Iterable, Iterator, List, Optional, Sequence, Set,
-                    Tuple, Union)
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import quote, unquote, urlparse
 
 import requests
@@ -100,6 +99,7 @@ CSV_HEADERS = [
 @dataclass
 class PageContent:
     """HTML content fetched from Wiktionary."""
+
     url: str
     soup: BeautifulSoup
 
@@ -107,6 +107,7 @@ class PageContent:
 @dataclass
 class DerivedVerb:
     """Structured representation of a derived German verb."""
+
     base: str
     derived: str
     prefix: str
@@ -188,6 +189,53 @@ class WiktionaryClient:
         time.sleep(sleep_for)
 
 
+def find_verb_anchor(german_nodes: Sequence[object]) -> Optional[Tag]:
+    """
+    Return an anchor (heading tag) that marks the start of the Verb entry.
+    Wiktionary DE often has a 'Wortart' heading with the word 'Verb' in the
+    following paragraph/table. We accept either:
+      - a heading with id/text 'Verb', OR
+      - a heading containing 'Wortart' when the immediate block mentions 'Verb'.
+    """
+    # 1) direct: heading 'Verb'
+    direct = find_heading(german_nodes, ("Verb",))
+    if direct:
+        return direct
+
+    # 2) Wortart block that mentions 'Verb' nearby
+    for node in german_nodes:
+        if not isinstance(node, Tag):
+            continue
+        heading_tag = _extract_heading_tag(node)
+        if not heading_tag:
+            continue
+        title = heading_tag.get_text(strip=True).lower()
+        if "wortart" in title:
+            # scan a short window after 'Wortart' for 'Verb'
+            window = []
+            for sib in iterate_section_after_heading(heading_tag):
+                if isinstance(sib, Tag):
+                    if sib.name in {"h3", "h4", "h5"}:
+                        break
+                    window.append(sib)
+                # limit scanning a bit
+                if len(window) > 8:
+                    break
+            # text of window
+            win_text = " ".join(
+                clean_text(x) for x in window if isinstance(x, Tag)
+            ).lower()
+            if "verb" in win_text:
+                return heading_tag
+
+    return None
+
+
+def page_title_text(soup: BeautifulSoup) -> str:
+    t = soup.find("h1")
+    return clean_text(t) if t else ""
+
+
 def derive_for_bases(
     bases: Iterable[str],
     *,
@@ -226,7 +274,7 @@ def derive_for_bases(
             wide = extract_candidate_lemmas_anywhere(base_page.soup, base)
             if progress:
                 print(f"  fallback(anywhere): +{len(wide)} candidates for '{base}'.")
-            candidates |= wide        
+            candidates |= wide
 
         seen: Set[str] = set()
         prefix_counter: Dict[str, int] = {}
@@ -250,6 +298,29 @@ def derive_for_bases(
 
             candidate_page = wiktionary.fetch(candidate)
             if not candidate_page:
+                if progress:
+                    print(f"    skip: no page for {candidate}")
+                continue
+
+            # quick title-based filter: skip pages that are clearly not lemmas
+            page_title = page_title_text(candidate_page.soup).lower()
+            if any(s in page_title for s in ["konjugation", "partizip", "partizip ii"]):
+                if progress:
+                    print(
+                        f"    skip: looks like inflection/non-lemma page for {candidate} -> {page_title}"
+                    )
+                continue
+
+            entry = extract_verb_entry(
+                base=base,
+                derived=candidate,
+                prefix_label=prefix_label,
+                separability=separability,
+                page=candidate_page,
+            )
+            if not entry:
+                if progress:
+                    print(f"    skip: could not parse verb entry for {candidate}")
                 continue
 
             entry = extract_verb_entry(
@@ -267,7 +338,9 @@ def derive_for_bases(
             prefix_counter[prefix_label] = prefix_counter.get(prefix_label, 0) + 1
             if progress:
                 gloss_preview = (entry.gloss_de or "").split(".")[0][:80]
-                print(f"    ok: {candidate} ({prefix_label}, {separability}) -> {gloss_preview}")
+                print(
+                    f"    ok: {candidate} ({prefix_label}, {separability}) -> {gloss_preview}"
+                )
 
     return all_results
 
@@ -295,7 +368,11 @@ def extract_candidate_lemmas_anywhere(
         lower = lemma.lower()
         if "_" in lower:
             continue
-        if any(lower.startswith(pref) for pref in all_prefixes) and lower.endswith(base) and len(lower) > len(base):
+        if (
+            any(lower.startswith(pref) for pref in all_prefixes)
+            and lower.endswith(base)
+            and len(lower) > len(base)
+        ):
             candidates.add(lower)
 
     return candidates
@@ -331,18 +408,46 @@ def extract_deutsch_section(soup: BeautifulSoup) -> List[object]:
     """
     # try: any h2/span whose id starts with 'Deutsch'
     for h2 in soup.find_all("h2"):
-        span = h2.find("span", id=True)
-        if span and span.get("id", "").startswith("Deutsch"):
+        span_ids = [
+            span.get("id", "")
+            for span in h2.find_all("span", id=True)
+            if span.get("id")
+        ]
+        heading_text = h2.get_text(strip=True).lower()
+        if any(
+            sid.lower().startswith("deutsch")
+            or sid.lower().split("_")[0] == "deutsch"
+            for sid in span_ids
+        ) or "deutsch" in heading_text:
             nodes: List[object] = []
-            for sibling in h2.next_siblings:
-                if isinstance(sibling, Tag) and sibling.name == "h2":
-                    break
+            container: Tag = h2.parent if isinstance(h2.parent, Tag) else h2
+            for sibling in container.next_siblings:
+                if isinstance(sibling, Tag):
+                    # stop when the next language heading (wrapped in mw-heading2) starts
+                    classes = sibling.get("class", [])
+                    if sibling.name == "div" and classes and "mw-heading2" in classes:
+                        break
+                    if sibling.name == "h2":
+                        break
                 nodes.append(sibling)
-            return nodes
+            def flatten(items: Iterable[object]) -> Iterator[object]:
+                for item in items:
+                    if isinstance(item, Tag):
+                        classes = item.get("class", []) or []
+                        if item.name == "section":
+                            yield from flatten(list(item.children))
+                            continue
+                        if item.name == "div" and any(
+                            cls.startswith("mw-heading") for cls in classes
+                        ):
+                            yield from flatten(list(item.children))
+                            continue
+                    yield item
+
+            return list(flatten(nodes))
 
     # fallback — better to keep working than to drop everything
     return list(soup.body.children) if soup.body else list(soup.children)
-
 
 
 def identify_prefix(lemma: str, base: str) -> Optional[Tuple[str, str]]:
@@ -350,7 +455,7 @@ def identify_prefix(lemma: str, base: str) -> Optional[Tuple[str, str]]:
     # Check the longest matching prefix first.
     for prefix, label, separability in PREFIX_ORDER:
         if lemma.startswith(prefix):
-            remainder = lemma[len(prefix):]
+            remainder = lemma[len(prefix) :]
             if remainder == base:
                 return label, separability
     return None
@@ -363,25 +468,250 @@ def extract_verb_entry(
     separability: str,
     page: PageContent,
 ) -> Optional[DerivedVerb]:
-    """Extract relevant information from a derived verb page."""
+    """Extract relevant information from a derived verb page (robust on DE Wiktionary)."""
     german_nodes = extract_deutsch_section(page.soup)
     if not german_nodes:
         return None
 
-    verb_header = find_heading(german_nodes, ("Verb",))
-    if not verb_header:
-        return None
+    anchor = find_verb_anchor(german_nodes)
 
-    gloss_de = extract_first_gloss(verb_header)
-    example = extract_example(verb_header)
-    translations = extract_translations(verb_header)
+    # Try to extract gloss/translation/example starting from the anchor if present,
+    # otherwise from the whole German section as a fallback.
+    def first_gloss_from_nodes(nodes: Sequence[object]) -> str:
+        # Prefer a 'Bedeutungen' block; otherwise first ol/dl/p with some content
+        node_list = list(nodes)
+        # 1) Bedeutungen headings
+        for node in node_list:
+            if not isinstance(node, Tag):
+                continue
+            heading_tag = _extract_heading_tag(node)
+            if heading_tag:
+                title = heading_tag.get_text(strip=True).lower()
+                if "bedeut" in title:
+                    g = _gloss_from_definition_block(heading_tag)
+                    if g:
+                        return g
+        # 2) First list / deflist / paragraph with content
+        metadata_labels = {
+            "worttrennung",
+            "aussprache",
+            "silbentrennung",
+            "grammatik",
+            "referenzen",
+            "herkunft",
+            "ipa",
+            "h\u00f6rbeispiele",
+            "transitiv",
+            "intransitiv",
+            "trans.",
+            "intrans.",
+            "reflexiv",
+            "refl.",
+            "pronominal",
+            "impersonal",
+            "impers.",
+            "unpers\u00f6nlich",
+        }
+        flexion_keywords = (
+            "pr\u00e4teritum",
+            "partizip",
+            "konjugation",
+            "imperativ",
+            "futur",
+            "wortform",
+            "person ",
+            "ipa",
+            "h\u00f6rbeispiel",
+            "h\u00f6rbeispiele",
+        )
+        for idx, node in enumerate(node_list):
+            if not isinstance(node, Tag):
+                continue
+            if node.name in {"ol", "dl"}:
+                if node.name == "ol":
+                    li = node.find("li")
+                    if li:
+                        t = clean_text(li)
+                        if t:
+                            lowered = t.lower()
+                            if any(keyword in lowered for keyword in flexion_keywords):
+                                continue
+                            return t
+                t = clean_text(node)
+                if t:
+                    lowered = t.lower()
+                    if any(keyword in lowered for keyword in flexion_keywords):
+                        continue
+                    return t
+                continue
+            if node.name == "p":
+                text = clean_text(node)
+                if not text:
+                    continue
+                lowered = text.lower()
+                if "bedeut" in lowered:
+                    for follower in node_list[idx + 1 :]:
+                        if isinstance(follower, Tag) and follower.name in {"ol", "dl"}:
+                            if follower.name == "ol":
+                                li = follower.find("li")
+                                if li:
+                                    t = clean_text(li)
+                                    if t:
+                                        return t
+                            t = clean_text(follower)
+                            if t:
+                                return t
+                            break
+                    continue
+                base_label = lowered.rstrip(":")
+                if base_label in metadata_labels:
+                    continue
+                if lowered.endswith(":"):
+                    continue
+                if lowered.startswith(("ipa", "h\u00f6rbeispiel", "h\u00f6rbeispiele")):
+                    continue
+                if any(keyword in lowered for keyword in flexion_keywords):
+                    continue
+                return text
+        # 3) fallback: any tag with clean text that is not obvious metadata
+        for node in node_list:
+            if not isinstance(node, Tag):
+                continue
+            text = clean_text(node)
+            if not text:
+                continue
+            lowered = text.lower()
+            base_label = lowered.rstrip(":")
+            if base_label in metadata_labels or lowered.endswith(":"):
+                continue
+            if lowered.startswith(("ipa", "h\u00f6rbeispiel", "h\u00f6rbeispiele")):
+                continue
+            if any(keyword in lowered for keyword in ("bearbeiten", "[bearbeiten]")):
+                continue
+            if any(keyword in lowered for keyword in flexion_keywords):
+                continue
+            return text
+        return ""
+
+    # Build a limited slice after the anchor (or entire section)
+    scan_nodes: List[object] = []
+    if anchor is not None:
+        for sib in iterate_section_after_heading(anchor):
+            scan_nodes.append(sib)
+    else:
+        scan_nodes = list(german_nodes)
+
+    gloss_de = first_gloss_from_nodes(scan_nodes)
+    if not gloss_de:
+        return None  # nothing meaningful to store
+
+    # Translations: try to find an 'Übersetzungen' block in scan window first, else whole section
+    def translations_from_nodes(nodes: Sequence[object]) -> Dict[str, str]:
+        node_list = list(nodes)
+        for idx, node in enumerate(node_list):
+            if not isinstance(node, Tag):
+                continue
+            heading_tag = _extract_heading_tag(node)
+            if heading_tag:
+                if "übersetz" in heading_tag.get_text(strip=True).lower():
+                    parsed = _parse_translation_tables(heading_tag)
+                    if parsed:
+                        return parsed
+            if node.name == "p":
+                text = node.get_text(strip=True).lower()
+                if "übersetz" in text:
+                    collected: Dict[str, str] = {}
+                    for follower in node_list[idx + 1 :]:
+                        if isinstance(follower, Tag):
+                            if follower.name == "table":
+                                collected.update(_extract_translations_from_table(follower))
+                            else:
+                                next_heading = _extract_heading_tag(
+                                    follower, levels=("h3", "h4", "h5")
+                                )
+                                if next_heading:
+                                    break
+                    if collected:
+                        return collected
+        # fallback: try entire german section
+        full_list = list(german_nodes)
+        for idx, node in enumerate(full_list):
+            if not isinstance(node, Tag):
+                continue
+            heading_tag = _extract_heading_tag(node)
+            if heading_tag:
+                if "übersetz" in heading_tag.get_text(strip=True).lower():
+                    parsed = _parse_translation_tables(heading_tag)
+                    if parsed:
+                        return parsed
+            if node.name == "p":
+                text = node.get_text(strip=True).lower()
+                if "übersetz" in text:
+                    collected: Dict[str, str] = {}
+                    for follower in full_list[idx + 1 :]:
+                        if isinstance(follower, Tag):
+                            if follower.name == "table":
+                                collected.update(_extract_translations_from_table(follower))
+                            else:
+                                next_heading = _extract_heading_tag(
+                                    follower, levels=("h3", "h4", "h5")
+                                )
+                                if next_heading:
+                                    break
+                    if collected:
+                        return collected
+        return {}
+
+    translations = translations_from_nodes(scan_nodes)
+
+    # Example: look for a 'Beispiele' block near the anchor/scan window
+    def example_from_nodes(nodes: Sequence[object]) -> str:
+        node_list = list(nodes)
+        for idx, node in enumerate(node_list):
+            if not isinstance(node, Tag):
+                continue
+            heading_tag = _extract_heading_tag(node)
+            if heading_tag:
+                ttl = heading_tag.get_text(strip=True).lower()
+                if "beispiel" in ttl:
+                    s = _first_sentence_in_block(heading_tag)
+                    if s:
+                        return s
+            if node.name == "p":
+                text = node.get_text(strip=True).lower()
+                if "beispiel" in text:
+                    for follower in node_list[idx + 1 :]:
+                        if isinstance(follower, Tag):
+                            if follower.name in {"ul", "ol"}:
+                                first = follower.find("li")
+                                if first:
+                                    return clean_text(first)
+                                return clean_text(follower)
+                            if follower.name == "dl":
+                                first_dd = follower.find("dd")
+                                if first_dd:
+                                    snippet = clean_text(first_dd)
+                                    if snippet:
+                                        return snippet
+                            if follower.name == "p":
+                                snippet = clean_text(follower)
+                                if snippet:
+                                    return snippet
+                            next_heading = _extract_heading_tag(
+                                follower, levels=("h3", "h4", "h5")
+                            )
+                            if next_heading:
+                                break
+        return ""
+
+    example = example_from_nodes(scan_nodes)
 
     return DerivedVerb(
         base=base,
         derived=derived,
         prefix=prefix_label,
         separability=separability,
-        pos="Verb",
+        pos="Verb",  # we anchored on/near Wortart: Verb (or we had good DE gloss)
         gloss_de=gloss_de,
         gloss_es=translations.get("spanisch", ""),
         gloss_en=translations.get("englisch", ""),
@@ -399,14 +729,23 @@ def find_heading(
     for node in section_nodes:
         if not isinstance(node, Tag):
             continue
-        if node.name not in {"h3", "h4", "h5"}:
+        heading_tag = _extract_heading_tag(node)
+        if not heading_tag:
             continue
-        span = node.find("span", id=True)
-        if span and span.get("id", "").split("_")[0].lower() in normalized_targets:
-            return node
-        heading_text = node.get_text(strip=True).lower()
+        span_ids = [
+            span.get("id", "")
+            for span in heading_tag.find_all("span", id=True)
+            if span.get("id")
+        ]
+        for span_id in span_ids:
+            base_id = span_id.split("_")[0].lower()
+            if base_id in normalized_targets:
+                return heading_tag
+        heading_text = heading_tag.get_text(strip=True).lower()
         if heading_text in normalized_targets:
-            return node
+            return heading_tag
+        if any(heading_text.startswith(target) for target in normalized_targets):
+            return heading_tag
     return None
 
 
@@ -416,7 +755,10 @@ def extract_first_gloss(verb_heading: Tag) -> str:
     for node in iterate_section_after_heading(verb_heading):
         if isinstance(node, Tag):
             # 'Bedeutungen' section
-            if node.name in {"h3", "h4", "h5"} and "bedeut" in node.get_text(strip=True).lower():
+            if (
+                node.name in {"h3", "h4", "h5"}
+                and "bedeut" in node.get_text(strip=True).lower()
+            ):
                 gloss = _gloss_from_definition_block(node)
                 if gloss:
                     break
@@ -522,23 +864,47 @@ def _extract_translations_from_table(table: Tag) -> Dict[str, str]:
     return result
 
 
+def _extract_heading_tag(
+    node: Tag, levels: Sequence[str] = ("h3", "h4", "h5")
+) -> Optional[Tag]:
+    """Return the first heading tag within a container matching the desired levels."""
+    if node.name in levels:
+        return node
+    return node.find(list(levels), recursive=False)
+
+
 def iterate_section_after_heading(heading: Tag) -> Iterator[object]:
     """Yield siblings after a heading until the next same-level heading or H2."""
     stop_tags = {"h2"}
     level = heading.name
     current_id = _heading_id(heading)
+    container = heading
+    if isinstance(heading.parent, Tag):
+        parent_classes = heading.parent.get("class", [])
+        if (
+            heading.parent.name == "div"
+            and parent_classes
+            and any(cls.startswith("mw-heading") for cls in parent_classes)
+        ):
+            container = heading.parent
 
-    for sibling in heading.next_siblings:
+    for sibling in container.next_siblings:
         if isinstance(sibling, Tag):
             if sibling.name in stop_tags:
                 break
-            # Stop if a same/higher level heading of a different subsection appears
-            if _is_same_or_higher_level(level, sibling.name):
-                sibling_id = _heading_id(sibling)
-                if sibling_id != current_id:
+            candidate = _extract_heading_tag(
+                sibling, levels=("h2", "h3", "h4", "h5", "h6")
+            )
+            if candidate:
+                candidate_name = candidate.name
+                if candidate_name in stop_tags:
                     break
-                if sibling_id is None and sibling.name == heading.name:
-                    break
+                if _is_same_or_higher_level(level, candidate_name):
+                    candidate_id = _heading_id(candidate)
+                    if candidate_id != current_id:
+                        break
+                    if candidate_id is None and candidate_name == heading.name:
+                        break
         yield sibling
 
 
@@ -671,13 +1037,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         include_ambiguous=args.include_ambiguous,
         progress=not args.quiet,
     )
-    if not derived:
-        print("No derived verbs found.", file=sys.stderr)
-        return 2
 
-    write_outputs(derived, args.out_csv, args.out_json)
+    csv_path = args.out_csv.resolve()
+    json_path = args.out_json.resolve()
+    write_outputs(derived, csv_path, json_path)
+
     if not args.quiet:
-        print(f"Wrote {len(derived)} rows to {args.out_csv} and {args.out_json}.")
+        if derived:
+            print(f"Wrote {len(derived)} rows to {csv_path} and {json_path}.")
+        else:
+            print(
+                f"No derived verbs found. Wrote empty files to {csv_path} and {json_path}."
+            )
+
     return 0
 
 

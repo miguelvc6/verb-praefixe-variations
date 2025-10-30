@@ -35,15 +35,5 @@ Key options:
 - `--include-ambiguous` keeps verbs whose prefix can be separable or inseparable.
 - `--quiet` hides progress output.
 
-The output rows/objects use these columns:  
+The output rows/objects use these columns:
 `base, derived, prefix, separability, pos, gloss_de, gloss_es, gloss_en, example, wiktionary_url`
-
-## Tests
-
-Execute the basic smoke test (network access required):
-
-```bash
-python -m pytest
-```
-
-The tests confirm that at least a handful of derivatives are collected for `gehen` and `nehmen`, that both separable and inseparable prefixes appear, and that the CSV writer preserves the expected columns.
