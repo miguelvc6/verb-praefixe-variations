@@ -21,19 +21,13 @@ Run the scraper by providing either a comma separated list of verbs or a file (o
 ```bash
 python derive_verbs.py \
   --verbs "gehen,nehmen,stehen,tragen,ziehen" \
-  --out-csv data/derivados.csv \
-  --out-json data/derivados.json \
-  --max-per-prefix 20 \
-  --include-ambiguous
+  --out data/derivados
 ```
 
 Key options:
 
-- `--verbs` comma separated list of base verbs.
-- `--verbs-file` path to a text file (one verb per line).
-- `--max-per-prefix` limits how many compounds to keep for each prefix.
-- `--include-ambiguous` keeps verbs whose prefix can be separable or inseparable.
-- `--quiet` hides progress output.
+- `--verbs` comma separated list of base verbs or a path to a text file.
+- `--out` output file stem; the script writes both `.csv` and `.json`.
 
 The output rows/objects use these columns:
 `base, derived, prefix, separability, pos, gloss_de, gloss_es, gloss_en, example, wiktionary_url`
