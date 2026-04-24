@@ -42,8 +42,8 @@ def test_generate_cards_skips_low_quality_and_adds_contrast():
     senses = load_input(FIXTURE)
     cards = generate_cards(senses)
     assert not validate_cards(cards)
-    assert any(card.cardtype == "context" for card in cards)
-    assert any(card.cardtype == "construction" for card in cards)
+    assert any(card.cardtype == "context_cloze" for card in cards)
+    assert not any(card.cardtype == "construction" for card in cards)
     assert any(card.cardtype == "contrast" and "___" in card.front for card in cards)
     assert all("aussetzen" not in card.key for card in cards)
 
@@ -51,5 +51,5 @@ def test_generate_cards_skips_low_quality_and_adds_contrast():
 def test_csv_export_writes_grouped_files(tmp_path):
     cards = generate_cards(load_input(FIXTURE))
     write_csv_export(cards, tmp_path)
-    assert (tmp_path / "anki_cards_context.csv").exists()
+    assert (tmp_path / "anki_cards_context_cloze.csv").exists()
     assert (tmp_path / "anki_cards_contrast.csv").exists()

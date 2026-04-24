@@ -21,6 +21,45 @@ from quality_utils import (
     parse_optional_bool as shared_parse_optional_bool,
 )
 
+DEFAULT_CARD_TYPES = (
+    "context_cloze",
+    "prefix_cloze",
+    "translation_de_to_es",
+    "translation_es_to_de",
+    "separability",
+    "contrast",
+)
+CARD_TYPE_ALIASES = {
+    "context": "context_cloze",
+    "context_cloze": "context_cloze",
+    "prefix": "prefix_cloze",
+    "prefix_cloze": "prefix_cloze",
+    "translation_de_to_es": "translation_de_to_es",
+    "de_to_es": "translation_de_to_es",
+    "translation_es_to_de": "translation_es_to_de",
+    "es_to_de": "translation_es_to_de",
+    "separability": "separability",
+    "contrast": "contrast",
+    "construction": "construction",
+}
+GENERIC_SPANISH_VERBS = {
+    "traer",
+    "llevar",
+    "poner",
+    "hacer",
+    "dar",
+    "pasar",
+    "tomar",
+    "quitar",
+    "dejar",
+    "ir",
+    "venir",
+    "estar",
+    "ser",
+    "tener",
+}
+
+
 @dataclass
 class AnkiVerbSense:
     base: str
@@ -68,6 +107,10 @@ class AnkiCard:
     answer: str = ""
     source_derived: str = ""
     source_sense_id: int = 0
+    source_base: str = ""
+    source_prefix: str = ""
+    source_participle_ii: str = ""
+    source_present_3sg: str = ""
 
 
 def stable_int_id(text: str, modulo: int = 10**10) -> int:
@@ -260,6 +303,17 @@ def is_valid_context_answer(sense: AnkiVerbSense, answer: str) -> bool:
     )
 
 
+def card_source_metadata(sense: AnkiVerbSense) -> Dict[str, Any]:
+    return {
+        "source_derived": sense.derived,
+        "source_sense_id": sense.sense_id,
+        "source_base": sense.base,
+        "source_prefix": sense.prefix,
+        "source_participle_ii": sense.participle_ii,
+        "source_present_3sg": sense.present_3sg,
+    }
+
+
 def blanking_candidates(sense: AnkiVerbSense) -> List[str]:
     """Return conservative verb forms that may safely be blanked."""
     candidates = [sense.derived, sense.participle_ii]
@@ -290,18 +344,51 @@ def normalize_tag(tag: str) -> str:
     return re.sub(r"[^a-z0-9_:\-äöüß]+", "_", tag)
 
 
-def generate_cards(senses: Sequence[AnkiVerbSense], *, include_low_quality: bool = False) -> List[AnkiCard]:
+def normalize_card_types(card_types: Optional[Iterable[str]]) -> set[str]:
+    """Normalize requested card types while accepting older aliases."""
+    raw_types = card_types or DEFAULT_CARD_TYPES
+    normalized: set[str] = set()
+    for raw in raw_types:
+        key = raw.strip().lower()
+        if not key:
+            continue
+        if key not in CARD_TYPE_ALIASES:
+            raise ValueError(f"Unknown card type: {raw}")
+        normalized.add(CARD_TYPE_ALIASES[key])
+    return normalized
+
+
+def parse_card_types(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def generate_cards(
+    senses: Sequence[AnkiVerbSense],
+    *,
+    include_low_quality: bool = False,
+    card_types: Optional[Iterable[str]] = None,
+) -> List[AnkiCard]:
     """Generate all default Anki cards."""
     usable = [sense for sense in senses if include_low_quality or sense.is_quality_ok]
+    enabled = normalize_card_types(card_types)
     cards: List[AnkiCard] = []
 
     for sense in usable:
-        cards.extend(generate_context_cards(sense))
-        cards.extend(generate_prefix_cloze_cards(sense))
-        cards.extend(generate_construction_cards(sense))
+        if "context_cloze" in enabled:
+            cards.extend(generate_context_cards(sense))
+        if "prefix_cloze" in enabled:
+            cards.extend(generate_prefix_cloze_cards(sense))
+        if "translation_de_to_es" in enabled:
+            cards.extend(generate_translation_de_to_es_cards(sense))
+        if "translation_es_to_de" in enabled:
+            cards.extend(generate_translation_es_to_de_cards(sense))
+        if "construction" in enabled:
+            cards.extend(generate_construction_cards(sense))
 
-    cards.extend(generate_separability_cards(usable))
-    cards.extend(generate_contrast_cards(usable))
+    if "separability" in enabled:
+        cards.extend(generate_separability_cards(usable))
+    if "contrast" in enabled:
+        cards.extend(generate_contrast_cards(usable))
     return dedupe_cards(cards)
 
 
@@ -310,27 +397,17 @@ def generate_context_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
     if not blank:
         return []
     front_example, answer = blank
-    front = f"Completa la frase:<br><br>{escape(front_example)}<br><br>Pista: {escape(sense.anki_hint_es or sense.gloss_es)}"
-    back = card_back(
-        answer=answer,
-        example_de=sense.example_de,
-        example_es=sense.example_es,
-        gloss_es=sense.gloss_es,
-        gloss_en=sense.gloss_en,
-        construction=sense.construction,
-        separability=sense.separability,
-        source_url=sense.wiktionary_url,
-    )
+    front = f"Completa la frase:<br><br>{escape(front_example)}"
+    back = f'<div class="answer">{escape(answer)}</div>{render_back_details(sense)}'
     return [
         AnkiCard(
-            cardtype="context",
-            key=f"context:{sense.derived}:{sense.sense_id}",
+            cardtype="context_cloze",
+            key=f"context_cloze:{sense.derived}:{sense.sense_id}",
             front=front,
             back=back,
-            tags=build_tags(sense, "context"),
+            tags=build_tags(sense, "context_cloze"),
             answer=answer,
-            source_derived=sense.derived,
-            source_sense_id=sense.sense_id,
+            **card_source_metadata(sense),
         )
     ]
 
@@ -340,11 +417,14 @@ def generate_prefix_cloze_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
     if not blank:
         return []
     front_example, answer = blank
-    front = (
-        f"Completa el prefijo:<br><br>{escape(front_example)}"
-        f"<br><br>Pista: {escape(sense.gloss_es)}<br>Base: {escape(sense.base)}"
+    front = f"Completa el prefijo:<br><br>{escape(front_example)}"
+    back = (
+        f'<div class="answer">{escape(answer)}</div>'
+        f'<div class="example">{escape(sense.example_de)}</div>'
+        f"<p><b>{escape(sense.derived)}</b> = {escape(sense.gloss_es)}</p>"
+        f"<p><b>Base:</b> {escape(sense.base)}</p>"
+        f"{render_back_details(sense, include_example=False)}"
     )
-    back = f"{escape(answer)}<br><br>{escape(sense.derived)} = {escape(sense.gloss_es)}<br>Separabilidad: {escape(sense.separability)}"
     return [
         AnkiCard(
             cardtype="prefix_cloze",
@@ -353,8 +433,47 @@ def generate_prefix_cloze_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
             back=back,
             tags=build_tags(sense, "prefix_cloze"),
             answer=answer,
-            source_derived=sense.derived,
-            source_sense_id=sense.sense_id,
+            **card_source_metadata(sense),
+        )
+    ]
+
+
+def generate_translation_de_to_es_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
+    if not sense.derived or not sense.gloss_es:
+        return []
+    front_parts = [escape(sense.derived)]
+    construction_hint = german_construction_hint_for_de_to_es(sense)
+    if construction_hint:
+        front_parts.append(escape(construction_hint))
+    front = "<br>".join(front_parts)
+    back = f'<div class="answer">{escape(sense.gloss_es)}</div>{render_translation_back_details(sense, include_gloss=False)}'
+    return [
+        AnkiCard(
+            cardtype="translation_de_to_es",
+            key=f"translation_de_to_es:{sense.derived}:{sense.sense_id}",
+            front=front,
+            back=back,
+            tags=build_tags(sense, "translation_de_to_es"),
+            answer=sense.gloss_es,
+            **card_source_metadata(sense),
+        )
+    ]
+
+
+def generate_translation_es_to_de_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
+    prompt = spanish_prompt_for_es_to_de(sense)
+    if not prompt:
+        return []
+    back = f'<div class="answer">{escape(sense.derived)}</div>{render_translation_back_details(sense)}'
+    return [
+        AnkiCard(
+            cardtype="translation_es_to_de",
+            key=f"translation_es_to_de:{sense.derived}:{sense.sense_id}",
+            front=escape(prompt),
+            back=back,
+            tags=build_tags(sense, "translation_es_to_de"),
+            answer=sense.derived,
+            **card_source_metadata(sense),
         )
     ]
 
@@ -373,19 +492,97 @@ def generate_construction_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
             back=back,
             tags=build_tags(sense, "construction"),
             answer=sense.construction,
-            source_derived=sense.derived,
-            source_sense_id=sense.sense_id,
+            **card_source_metadata(sense),
         )
     ]
 
 
 def is_useful_construction(sense: AnkiVerbSense) -> bool:
-    return is_useful_construction_data(
+    construction_l = sense.construction.lower()
+    if contains_pseudo_construction(construction_l):
+        return False
+    if not is_useful_construction_data(
         construction=sense.construction,
         derived=sense.derived,
         base=sense.base,
         prefix=sense.prefix,
+    ):
+        return False
+    simple_accusative = (
+        "akkusativobjekt" in construction_l
+        or construction_l.strip() in {f"{sense.derived.lower()} + akkusativ", "verb + akkusativobjekt"}
     )
+    has_extra_feature = (
+        sense.is_reflexive
+        or sense.takes_dative is True
+        or bool(sense.fixed_preposition)
+        or any(token in construction_l for token in ("sich", "dativ", "jemandem", "an +", "auf +", "mit +", "zu +"))
+    )
+    if simple_accusative and not has_extra_feature:
+        return False
+    return True
+
+
+def contains_pseudo_construction(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return "subject +" in lowered or "subjekt +" in lowered or "sujeto +" in lowered
+
+
+def spanish_prompt_for_es_to_de(sense: AnkiVerbSense) -> Optional[str]:
+    """Return a disambiguated Spanish prompt, or None if too generic."""
+    for value in (sense.construction_es, sense.gloss_es, sense.anki_hint_es):
+        prompt = clean_prompt(value)
+        if prompt and is_specific_spanish_prompt(prompt) and not prompt_leaks_german_answer(prompt, sense):
+            return prompt
+    return None
+
+
+def clean_prompt(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip(" .;:")
+
+
+def is_specific_spanish_prompt(prompt: str) -> bool:
+    lowered = prompt.lower().strip()
+    if not lowered:
+        return False
+    if lowered in GENERIC_SPANISH_VERBS:
+        return False
+    words = re.findall(r"[a-záéíóúüñ]+", lowered)
+    if len(words) == 1 and words[0] in GENERIC_SPANISH_VERBS:
+        return False
+    if len(words) > 1:
+        return True
+    return words[0] not in GENERIC_SPANISH_VERBS if words else False
+
+
+def prompt_leaks_german_answer(prompt: str, sense: AnkiVerbSense) -> bool:
+    """Return True when a Spanish prompt contains the German answer."""
+    lowered = str(prompt or "").lower()
+    leaked_terms = {
+        sense.derived.lower(),
+        sense.participle_ii.lower(),
+        sense.present_3sg.lower(),
+    }
+    prefix_plain = sense.prefix.rstrip("-").lower()
+    if prefix_plain and sense.base:
+        leaked_terms.add(f"{prefix_plain}{sense.base.lower()}")
+    return any(term and term in lowered for term in leaked_terms)
+
+
+def german_construction_hint_for_de_to_es(sense: AnkiVerbSense) -> str:
+    """Return a construction hint only when it adds non-duplicate structure."""
+    if not is_useful_construction(sense):
+        return ""
+    construction = clean_prompt(sense.construction)
+    lowered = construction.lower()
+    derived = sense.derived.lower()
+    if not construction:
+        return ""
+    if derived and derived in lowered:
+        return ""
+    if re.search(rf"^{re.escape(derived)}\s*\[[^\]]+\]$", lowered):
+        return ""
+    return construction
 
 
 def generate_separability_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCard]:
@@ -407,7 +604,12 @@ def generate_separability_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCar
             continue
         answer = "Sí." if sense.separability == "separable" else "No."
         front = f"¿Es separable?<br><br>{escape(sense.derived)}"
-        back = f"{answer}<br><br>Presente:<br>{escape(present)}<br><br>Perfekt:<br>{escape(perfect)}"
+        back = (
+            f'<div class="answer">{answer}</div>'
+            f"<p><b>Presente:</b><br>{escape(present)}</p>"
+            f"<p><b>Perfekt:</b><br>{escape(perfect)}</p>"
+            f"{render_back_details(sense, include_source=False)}"
+        )
         cards.append(
             AnkiCard(
                 cardtype="separability",
@@ -416,8 +618,7 @@ def generate_separability_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCar
                 back=back,
                 tags=build_tags(sense, "separability"),
                 answer=sense.separability,
-                source_derived=sense.derived,
-                source_sense_id=sense.sense_id,
+                **card_source_metadata(sense),
             )
         )
     return cards
@@ -462,7 +663,13 @@ def build_perfect_phrase(sense: AnkiVerbSense) -> str:
 
 def contains_bad_generated_phrase(text: str) -> bool:
     lowered = strip_html(text).lower()
-    return any(bad in lowered for bad in ("er haben", "er sein", "subject", "subjekt +", "..."))
+    return (
+        re.search(r"\ber\s+haben\b", lowered) is not None
+        or re.search(r"\ber\s+sein\b", lowered) is not None
+        or "subject" in lowered
+        or "subjekt +" in lowered
+        or "..." in lowered
+    )
 
 
 def generate_contrast_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCard]:
@@ -506,8 +713,7 @@ def generate_contrast_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCard]:
                     back=back,
                     tags=build_tags(target, "contrast"),
                     answer=target.derived,
-                    source_derived=target.derived,
-                    source_sense_id=target.sense_id,
+                    **card_source_metadata(target),
                 )
             )
     return cards
@@ -583,6 +789,68 @@ def card_back(
     return "\n".join(parts)
 
 
+def render_back_details(
+    sense: AnkiVerbSense,
+    *,
+    include_example: bool = True,
+    include_gloss: bool = True,
+    include_construction_es: bool = True,
+    include_separability: bool = True,
+    include_source: bool = True,
+) -> str:
+    """Render reusable learner-facing details for card backs."""
+    parts: List[str] = []
+    if include_gloss and sense.gloss_es:
+        parts.append(f"<p><b>Significado:</b><br>{escape(sense.gloss_es)}</p>")
+    if include_example and sense.example_de:
+        parts.append(f'<div class="example"><b>Ejemplo:</b><br>{escape(sense.example_de)}</div>')
+    if sense.example_es:
+        parts.append(f'<div class="translation"><b>Traducción:</b><br>{escape(sense.example_es)}</div>')
+    if sense.construction and is_useful_construction(sense):
+        parts.append(f"<p><b>Construcción:</b><br>{escape(sense.construction)}</p>")
+    if include_construction_es and sense.construction_es and is_useful_construction(sense):
+        parts.append(f"<p><b>Construcción ES:</b><br>{escape(sense.construction_es)}</p>")
+    sep = render_separability_summary(sense) if include_separability else ""
+    if include_separability and sep:
+        parts.append(f"<p><b>Separabilidad:</b><br>{escape(sep)}</p>")
+    if sense.perfect_example_de:
+        parts.append(f"<p><b>Perfekt:</b><br>{escape(sense.perfect_example_de)}</p>")
+    if include_source and sense.wiktionary_url:
+        parts.append(f"<p><b>Fuente:</b><br>{escape(sense.wiktionary_url)}</p>")
+    return f'<div class="meta">{"".join(parts)}</div>' if parts else ""
+
+
+def render_translation_back_details(sense: AnkiVerbSense, *, include_gloss: bool = True) -> str:
+    """Render details for translation cards without redundant metadata."""
+    return render_back_details(
+        sense,
+        include_gloss=include_gloss,
+        include_construction_es=False,
+        include_separability=False,
+        include_source=False,
+    )
+
+
+def render_separability_summary(sense: AnkiVerbSense) -> str:
+    bits = [sense.separability] if sense.separability else []
+    present = render_present_pattern(sense)
+    if present:
+        bits.append(present)
+    if sense.participle_ii:
+        bits.append(sense.participle_ii)
+    return " — ".join(bits)
+
+
+def render_present_pattern(sense: AnkiVerbSense) -> str:
+    present = (sense.present_3sg or "").strip()
+    if not present:
+        return ""
+    parts = present.split()
+    if sense.separability == "separable" and len(parts) >= 2:
+        return f"{parts[0]} ... {' '.join(parts[1:])}"
+    return present
+
+
 def escape(value: Any) -> str:
     return html.escape(str(value or ""), quote=False)
 
@@ -620,23 +888,52 @@ def validate_cards(cards: Sequence[AnkiCard], *, strict: bool = False) -> List[s
     errors: List[str] = []
     seen: set[Tuple[str, str]] = set()
     for card in cards:
-        lower_text = strip_html(f"{card.front} {card.back}").lower()
+        front_text = strip_html(card.front)
+        back_text = strip_html(card.back)
+        lower_text = f"{front_text} {back_text}".lower()
+        front_lower = front_text.lower()
         if not card.front.strip():
             errors.append(f"{card.key}: empty front")
         if not card.back.strip():
             errors.append(f"{card.key}: empty back")
-        if card.cardtype in {"context", "prefix_cloze", "contrast"}:
-            if "___" not in card.front:
-                errors.append(f"{card.key}: {card.cardtype} card has no blank")
+        if card.cardtype in {"context", "context_cloze", "prefix_cloze", "contrast"}:
+            if card.front.count("___") != 1:
+                errors.append(f"{card.key}: {card.cardtype} card must have exactly one blank")
             if not card.answer:
                 errors.append(f"{card.key}: {card.cardtype} card has no answer")
-        if card.cardtype == "prefix_cloze" and len(card.answer.split()) > 1:
-            errors.append(f"{card.key}: prefix_cloze answer should be prefix token")
+        if card.cardtype in {"context", "context_cloze", "prefix_cloze"}:
+            if "pista:" in front_lower:
+                errors.append(f"{card.key}: front contains Pista")
+            if "base:" in front_lower:
+                errors.append(f"{card.key}: front contains Base")
+        if card.cardtype in {"context", "context_cloze"} and card.answer:
+            sense_stub = card_sense_stub(card)
+            if not is_valid_context_answer(sense_stub, card.answer):
+                errors.append(f"{card.key}: context answer does not look verbal")
+        if card.cardtype == "prefix_cloze":
+            if not is_valid_prefix_answer(card):
+                errors.append(f"{card.key}: prefix_cloze answer should be a prefix or prefixed verb form")
         if card.cardtype == "separability":
-            if "er haben" in lower_text or "er sein" in lower_text:
+            if re.search(r"\ber\s+haben\b", lower_text) or re.search(r"\ber\s+sein\b", lower_text):
                 errors.append(f"{card.key}: malformed perfect auxiliary")
             if "subject" in lower_text or "subjekt +" in lower_text:
                 errors.append(f"{card.key}: pseudo-pattern leaked into separability card")
+        if card.cardtype == "translation_de_to_es":
+            if card.source_derived and card.source_derived not in front_text:
+                errors.append(f"{card.key}: DE->ES front missing derived verb")
+            if card.answer and card.answer in front_text:
+                errors.append(f"{card.key}: DE->ES front contains Spanish answer")
+            if card.source_derived and front_text.lower().count(card.source_derived.lower()) > 1:
+                errors.append(f"{card.key}: DE->ES front repeats derived verb")
+            if card.answer and card.answer not in back_text:
+                errors.append(f"{card.key}: DE->ES back missing Spanish answer")
+        if card.cardtype == "translation_es_to_de":
+            if is_bare_generic_spanish_prompt(front_text):
+                errors.append(f"{card.key}: ES->DE front is a bare generic Spanish verb")
+            if card.source_derived and card.source_derived.lower() in front_text.lower():
+                errors.append(f"{card.key}: ES->DE front leaks German answer")
+            if card.source_derived and card.source_derived not in back_text:
+                errors.append(f"{card.key}: ES->DE back missing derived verb")
         if card.cardtype == "construction":
             if "subject +" in lower_text or "subjekt + verb + objekt" in lower_text:
                 errors.append(f"{card.key}: generic construction card")
@@ -649,6 +946,32 @@ def validate_cards(cards: Sequence[AnkiCard], *, strict: bool = False) -> List[s
     if strict and not cards:
         errors.append("strict validation: no cards generated")
     return errors
+
+
+def card_sense_stub(card: AnkiCard) -> AnkiVerbSense:
+    return AnkiVerbSense(
+        base=card.source_base,
+        derived=card.source_derived,
+        sense_id=card.source_sense_id,
+        prefix=card.source_prefix,
+        separability="",
+        participle_ii=card.source_participle_ii,
+        present_3sg=card.source_present_3sg,
+    )
+
+
+def is_valid_prefix_answer(card: AnkiCard) -> bool:
+    answer = card.answer.strip().lower()
+    if not answer or len(answer.split()) > 1:
+        return False
+    if card.source_derived and card.source_derived.lower().startswith(answer):
+        return True
+    return bool(re.match(r"^[a-zäöüß]+(?:ge)?[a-zäöüß]*(?:en|t)$", answer))
+
+
+def is_bare_generic_spanish_prompt(prompt: str) -> bool:
+    words = re.findall(r"[a-záéíóúüñ]+", prompt.lower())
+    return len(words) == 1 and words[0] in GENERIC_SPANISH_VERBS
 
 
 def write_csv_export(cards: Sequence[AnkiCard], out_dir: Path) -> None:
@@ -728,6 +1051,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=Path("anki_export"), help="CSV export directory.")
     parser.add_argument("--deck-name", default="German Prefix Verbs")
     parser.add_argument("--format", choices=["apkg", "csv"], default="apkg")
+    parser.add_argument(
+        "--card-types",
+        default=",".join(DEFAULT_CARD_TYPES),
+        help="Comma-separated card types. Defaults exclude construction cards.",
+    )
     parser.add_argument("--include-low-quality", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--strict", action="store_true", help="Fail validation on low-quality senses or malformed cards.")
@@ -738,7 +1066,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
         senses = load_input(args.input)
-        cards = generate_cards(senses, include_low_quality=args.include_low_quality)
+        cards = generate_cards(
+            senses,
+            include_low_quality=args.include_low_quality,
+            card_types=parse_card_types(args.card_types),
+        )
         errors = validate_senses_for_card_generation(senses, strict=args.strict)
         errors.extend(validate_cards(cards, strict=args.strict))
     except Exception as exc:
