@@ -327,16 +327,16 @@ def model_to_dict(model: Any) -> Dict[str, Any]:
     if isinstance(model, dict):
         return model
     if hasattr(model, "model_dump"):
-        return model.model_dump()
+        return model.model_dump(by_alias=True)
     if hasattr(model, "dict"):
-        return model.dict()
+        return model.dict(by_alias=True)
     raise TypeError("Unsupported parsed response object")
 
 
 def enrichment_model_class() -> Optional[Any]:
     """Create Pydantic models lazily so pydantic remains optional."""
     try:
-        from pydantic import BaseModel
+        from pydantic import BaseModel, Field
     except ImportError:
         return None
 
@@ -352,7 +352,7 @@ def enrichment_model_class() -> Optional[Any]:
         example_en: str
         example_de_with_blank: str
         answer: str
-        register: str
+        register_: str = Field(alias="register")
         difficulty: str
         frequency_bucket: str
         is_reflexive: bool
