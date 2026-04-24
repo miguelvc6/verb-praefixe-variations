@@ -44,7 +44,7 @@ def test_generate_cards_skips_low_quality_and_adds_contrast():
     assert not validate_cards(cards)
     assert any(card.cardtype == "context" for card in cards)
     assert any(card.cardtype == "construction" for card in cards)
-    assert any(card.cardtype == "contrast" and "Familia: stellen" in card.front for card in cards)
+    assert any(card.cardtype == "contrast" and "___" in card.front for card in cards)
     assert all("aussetzen" not in card.key for card in cards)
 
 

@@ -21,6 +21,13 @@ from urllib.parse import quote, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup, Tag
+from quality_utils import (
+    BLOCKING_QUALITY_FLAGS,
+    detect_quality_flags as shared_detect_quality_flags,
+    is_quality_ok,
+    normalize_perfect_auxiliary,
+    parse_optional_bool,
+)
 
 BASE_URL_TEMPLATE = "https://de.wiktionary.org/wiki/{}"
 
@@ -80,6 +87,8 @@ CSV_HEADERS = [
     "example_en",
     "example_de_with_blank",
     "answer",
+    "present_example_de",
+    "perfect_example_de",
     "construction",
     "construction_es",
     "register",
@@ -146,17 +155,6 @@ FLEXION_KEYWORDS = (
     "hörbeispiel",
     "hörbeispiele",
 )
-BLOCKING_QUALITY_FLAGS = {
-    "missing_gloss_de",
-    "missing_gloss_es",
-    "missing_example_de",
-    "placeholder_gloss",
-    "placeholder_example",
-    "suspected_participle",
-    "short_or_metadata_gloss",
-}
-
-
 @dataclass
 class PageContent:
     """HTML content fetched from Wiktionary."""
@@ -178,6 +176,8 @@ class VerbSense:
     example_en: str = ""
     example_de_with_blank: str = ""
     answer: str = ""
+    present_example_de: str = ""
+    perfect_example_de: str = ""
     construction: str = ""
     construction_es: str = ""
     register: str = "unknown"
@@ -710,41 +710,7 @@ def normalize_example(text: str) -> str:
 
 def detect_quality_flags(row: Union[DerivedVerb, VerbSense, Dict[str, Any]]) -> List[str]:
     """Infer quality flags for a flat row, verb, or sense."""
-    data = row_to_quality_dict(row)
-    flags: List[str] = []
-    gloss_de = str(data.get("gloss_de") or "").strip()
-    gloss_es = str(data.get("gloss_es") or "").strip()
-    gloss_en = str(data.get("gloss_en") or "").strip()
-    example_de = str(data.get("example_de") or data.get("example") or "").strip()
-    derived = str(data.get("derived") or "").strip().lower()
-    prefix = str(data.get("prefix") or "").strip().lower()
-    register = str(data.get("register") or "").strip().lower()
-
-    if not gloss_de:
-        flags.append("missing_gloss_de")
-    if not gloss_es:
-        flags.append("missing_gloss_es")
-    if not gloss_en:
-        flags.append("missing_gloss_en")
-    if not example_de:
-        flags.append("missing_example_de")
-
-    lowered_gloss = gloss_de.lower()
-    lowered_example = example_de.lower()
-    if any(pattern in lowered_gloss for pattern in PLACEHOLDER_PATTERNS):
-        flags.append("placeholder_gloss")
-    if any(pattern in lowered_example for pattern in PLACEHOLDER_PATTERNS):
-        flags.append("placeholder_example")
-    if prefix == "ge-" or (derived.startswith("ge") and data.get("base")):
-        flags.append("suspected_participle")
-    if gloss_de and (len(gloss_de) < 8 or any(pattern in lowered_gloss for pattern in METADATA_GLOSS_PATTERNS)):
-        flags.append("short_or_metadata_gloss")
-    if example_de and len(example_de.split()) > 25:
-        flags.append("long_example")
-    if register in {"rare", "archaic", "domain-specific"}:
-        flags.append("rare_or_domain_specific")
-
-    return sorted(dict.fromkeys(flags))
+    return shared_detect_quality_flags(row_to_quality_dict(row))
 
 
 def row_to_quality_dict(row: Union[DerivedVerb, VerbSense, Dict[str, Any]]) -> Dict[str, Any]:
@@ -755,11 +721,20 @@ def row_to_quality_dict(row: Union[DerivedVerb, VerbSense, Dict[str, Any]]) -> D
             "base": row.base,
             "derived": row.derived,
             "prefix": row.prefix,
+            "separability": row.separability,
             "gloss_de": sense.gloss_de,
             "gloss_es": sense.gloss_es,
             "gloss_en": sense.gloss_en,
             "example_de": sense.example_de,
+            "example_de_with_blank": sense.example_de_with_blank,
+            "answer": sense.answer,
+            "construction": sense.construction,
+            "construction_es": sense.construction_es,
             "register": sense.register,
+            "present_3sg": sense.present_3sg,
+            "perfect_auxiliary": sense.perfect_auxiliary,
+            "participle_ii": sense.participle_ii,
+            "separable_sentence_pattern": sense.separable_sentence_pattern,
         }
     if isinstance(row, VerbSense):
         return asdict(row)
@@ -775,13 +750,20 @@ def needs_openai_enrichment(verb: DerivedVerb) -> bool:
     """Return whether a verb has thin enough data to ask OpenAI for help."""
     for sense in verb.senses:
         flags = set(sense.quality_flags)
-        if (
+        critical_missing = (
             not sense.gloss_es
             or not sense.gloss_en
             or not sense.example_de
-            or "placeholder_gloss" in flags
-            or "short_or_metadata_gloss" in flags
-        ):
+            or not sense.example_de_with_blank
+            or not sense.answer
+            or not sense.construction
+            or not sense.present_3sg
+            or not sense.perfect_auxiliary
+            or not sense.participle_ii
+            or sense.difficulty == "unknown"
+            or sense.frequency_bucket == "unknown"
+        )
+        if critical_missing or (flags & BLOCKING_QUALITY_FLAGS):
             return True
     return False
 
@@ -810,6 +792,8 @@ def apply_enrichment_payload(verb: DerivedVerb, payload: Dict[str, Any]) -> Deri
             example_en=str(raw.get("example_en") or ""),
             example_de_with_blank=str(raw.get("example_de_with_blank") or ""),
             answer=str(raw.get("answer") or verb.derived),
+            present_example_de=str(raw.get("present_example_de") or ""),
+            perfect_example_de=str(raw.get("perfect_example_de") or ""),
             construction=str(raw.get("construction") or ""),
             construction_es=str(raw.get("construction_es") or ""),
             register=str(raw.get("register") or "unknown"),
@@ -820,14 +804,21 @@ def apply_enrichment_payload(verb: DerivedVerb, payload: Dict[str, Any]) -> Deri
             takes_dative=parse_optional_bool(raw.get("takes_dative")),
             fixed_preposition=str(raw.get("fixed_preposition") or ""),
             present_3sg=str(raw.get("present_3sg") or ""),
-            perfect_auxiliary=str(raw.get("perfect_auxiliary") or ""),
+            perfect_auxiliary=normalize_perfect_auxiliary(raw.get("perfect_auxiliary")),
             participle_ii=str(raw.get("participle_ii") or ""),
             separable_sentence_pattern=str(raw.get("separable_sentence_pattern") or ""),
             anki_hint_es=str(raw.get("anki_hint_es") or raw.get("gloss_es") or ""),
         )
         model_flags = raw.get("quality_flags") if isinstance(raw.get("quality_flags"), list) else []
+        quality_input = {
+            **asdict(sense),
+            "derived": verb.derived,
+            "base": verb.base,
+            "prefix": verb.prefix,
+            "separability": verb.separability,
+        }
         sense.quality_flags = sorted(
-            dict.fromkeys([str(flag) for flag in model_flags] + detect_quality_flags({**asdict(sense), "derived": verb.derived, "base": verb.base, "prefix": verb.prefix}))
+            dict.fromkeys([str(flag) for flag in model_flags] + detect_quality_flags(quality_input))
         )
         if raw.get("suitable_for_anki") is False and "openai_marked_unsuitable" not in sense.quality_flags:
             sense.quality_flags.append("openai_marked_unsuitable")

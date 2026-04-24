@@ -13,12 +13,34 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+PROMPT_VERSION = "anki-quality-v2"
+
 SYSTEM_PROMPT = """You are a German-Spanish-English lexicographic assistant for Anki deck generation.
 Your task is to enrich German prefixed verbs for language learners.
 Return only valid JSON matching the requested schema.
 Do not invent rare meanings unless they are common enough for learners.
 Prefer common contemporary Standard German.
 If the source data is poor, say so in quality_flags but still provide a useful learner-oriented entry when possible.
+
+For Anki cloze fields, the blank must train the German verb, prefix, separated prefix, or participle. Never blank a noun, object, adjective, or unrelated word.
+
+For example_de_with_blank:
+- It must contain exactly one blank marker: ___.
+- The answer must be the exact text removed from the sentence.
+- The answer must be derived, the separated prefix, a conjugated verbal form, or participle_ii.
+- Do not use answers like nouns or objects.
+
+For separable verbs:
+- present_3sg must be written as separated form, e.g. "bringt zurück", "fährt ab", "geht weg".
+- Do not write "zurückbringt" for a separable verb.
+- participle_ii should be the standard Perfekt participle, e.g. "zurückgebracht".
+
+For inseparable verbs:
+- present_3sg must be written as one word, e.g. "verbringt", "bekommt".
+- participle_ii normally has no inserted "ge" after the prefix, e.g. "verbracht", "bekommen".
+
+perfect_auxiliary must be exactly "haben" or "sein".
+Return contemporary Standard German unless the word is genuinely rare or archaic.
 """
 
 ENRICHMENT_SCHEMA: Dict[str, Any] = {
@@ -44,6 +66,8 @@ ENRICHMENT_SCHEMA: Dict[str, Any] = {
                     "example_en": {"type": "string"},
                     "example_de_with_blank": {"type": "string"},
                     "answer": {"type": "string"},
+                    "present_example_de": {"type": "string"},
+                    "perfect_example_de": {"type": "string"},
                     "register": {
                         "type": "string",
                         "enum": ["common", "formal", "colloquial", "rare", "archaic", "domain-specific", "unknown"],
@@ -80,6 +104,8 @@ ENRICHMENT_SCHEMA: Dict[str, Any] = {
                     "example_en",
                     "example_de_with_blank",
                     "answer",
+                    "present_example_de",
+                    "perfect_example_de",
                     "register",
                     "difficulty",
                     "frequency_bucket",
@@ -146,6 +172,7 @@ class OpenAIEnricher:
     def cache_key(self, row: Dict[str, Any]) -> str:
         """Return stable cache key for the source fields that affect enrichment."""
         relevant = {
+            "prompt_version": PROMPT_VERSION,
             "base": row.get("base", ""),
             "derived": row.get("derived", ""),
             "prefix": row.get("prefix", ""),
@@ -284,6 +311,11 @@ Wiktionary English translation:
 Wiktionary example:
 {row.get("example_de") or row.get("example", "")}
 
+Important cloze rules:
+- Never blank a noun, object, adjective, or unrelated word.
+- The answer must be the exact text removed from example_de_with_blank.
+- The answer must be a German verb form, separated prefix, or participle.
+
 Return JSON with this schema:
 {json.dumps(ENRICHMENT_SCHEMA, ensure_ascii=False)}
 """
@@ -352,6 +384,8 @@ def enrichment_model_class() -> Optional[Any]:
         example_en: str
         example_de_with_blank: str
         answer: str
+        present_example_de: str
+        perfect_example_de: str
         register_: str = Field(alias="register")
         difficulty: str
         frequency_bucket: str

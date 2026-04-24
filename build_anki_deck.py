@@ -12,6 +12,14 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from quality_utils import (
+    detect_quality_flags as shared_detect_quality_flags,
+    is_quality_ok as shared_is_quality_ok,
+    is_useful_construction_data,
+    is_valid_verbal_answer,
+    normalize_perfect_auxiliary,
+    parse_optional_bool as shared_parse_optional_bool,
+)
 
 @dataclass
 class AnkiVerbSense:
@@ -28,6 +36,8 @@ class AnkiVerbSense:
     example_en: str = ""
     example_de_with_blank: str = ""
     answer: str = ""
+    present_example_de: str = ""
+    perfect_example_de: str = ""
     construction: str = ""
     construction_es: str = ""
     register: str = "unknown"
@@ -55,6 +65,9 @@ class AnkiCard:
     front: str
     back: str
     tags: List[str]
+    answer: str = ""
+    source_derived: str = ""
+    source_sense_id: int = 0
 
 
 def stable_int_id(text: str, modulo: int = 10**10) -> int:
@@ -108,10 +121,9 @@ def normalize_nested_sense(verb: Dict[str, Any], sense: Dict[str, Any]) -> AnkiV
 def normalize_flat_row(row: Dict[str, Any]) -> AnkiVerbSense:
     """Normalize old and new flat rows into one dataclass."""
     quality_flags = parse_quality_flags(row.get("quality_flags", []))
-    if not quality_flags:
-        quality_flags = detect_quality_flags(row)
+    quality_flags = sorted(dict.fromkeys(quality_flags + detect_quality_flags(row)))
     quality_ok_raw = row.get("is_quality_ok")
-    quality_ok = parse_bool_default(quality_ok_raw, is_quality_ok(quality_flags))
+    quality_ok = parse_bool_default(quality_ok_raw, True) and is_quality_ok(quality_flags)
 
     return AnkiVerbSense(
         base=str(row.get("base", "")),
@@ -127,6 +139,8 @@ def normalize_flat_row(row: Dict[str, Any]) -> AnkiVerbSense:
         example_en=str(row.get("example_en", "")),
         example_de_with_blank=str(row.get("example_de_with_blank", "")),
         answer=str(row.get("answer") or row.get("derived", "")),
+        present_example_de=str(row.get("present_example_de", "")),
+        perfect_example_de=str(row.get("perfect_example_de", "")),
         construction=str(row.get("construction", "")),
         construction_es=str(row.get("construction_es", "")),
         register=str(row.get("register") or "unknown"),
@@ -137,7 +151,7 @@ def normalize_flat_row(row: Dict[str, Any]) -> AnkiVerbSense:
         takes_dative=parse_optional_bool(row.get("takes_dative")),
         fixed_preposition=str(row.get("fixed_preposition", "")),
         present_3sg=str(row.get("present_3sg", "")),
-        perfect_auxiliary=str(row.get("perfect_auxiliary", "")),
+        perfect_auxiliary=normalize_perfect_auxiliary(row.get("perfect_auxiliary", "")),
         participle_ii=str(row.get("participle_ii", "")),
         separable_sentence_pattern=str(row.get("separable_sentence_pattern", "")),
         quality_flags=quality_flags,
@@ -178,79 +192,38 @@ def parse_bool_default(value: Any, default: bool) -> bool:
 
 
 def parse_optional_bool(value: Any) -> Optional[bool]:
-    if value is None or value == "":
-        return None
-    if isinstance(value, bool):
-        return value
-    lowered = str(value).strip().lower()
-    if lowered in {"true", "1", "yes", "ja"}:
-        return True
-    if lowered in {"false", "0", "no", "nein"}:
-        return False
-    return None
+    return shared_parse_optional_bool(value)
 
 
 def detect_quality_flags(row: Dict[str, Any]) -> List[str]:
-    flags: List[str] = []
-    gloss_de = str(row.get("gloss_de") or "").strip()
-    gloss_es = str(row.get("gloss_es") or "").strip()
-    gloss_en = str(row.get("gloss_en") or "").strip()
-    example_de = str(row.get("example_de") or row.get("example") or "").strip()
-    prefix = str(row.get("prefix") or "").strip().lower()
-    derived = str(row.get("derived") or "").strip().lower()
-    base = str(row.get("base") or "").strip().lower()
-    register = str(row.get("register") or "").strip().lower()
-    placeholder_patterns = ("dieser abschnitt fehlt", "hilf mit", "wiktionary zu vervollständigen")
-
-    if not gloss_de:
-        flags.append("missing_gloss_de")
-    if not gloss_es:
-        flags.append("missing_gloss_es")
-    if not gloss_en:
-        flags.append("missing_gloss_en")
-    if not example_de:
-        flags.append("missing_example_de")
-    if any(pattern in gloss_de.lower() for pattern in placeholder_patterns):
-        flags.append("placeholder_gloss")
-    if any(pattern in example_de.lower() for pattern in placeholder_patterns):
-        flags.append("placeholder_example")
-    if prefix == "ge-" or (derived.startswith("ge") and bool(base)):
-        flags.append("suspected_participle")
-    if gloss_de and (len(gloss_de) < 8 or "duden online" in gloss_de.lower()):
-        flags.append("short_or_metadata_gloss")
-    if example_de and len(example_de.split()) > 25:
-        flags.append("long_example")
-    if register in {"rare", "archaic", "domain-specific"}:
-        flags.append("rare_or_domain_specific")
-    return sorted(dict.fromkeys(flags))
+    return shared_detect_quality_flags(row)
 
 
 def is_quality_ok(flags: Sequence[str]) -> bool:
-    blocking = {
-        "missing_gloss_de",
-        "missing_gloss_es",
-        "missing_example_de",
-        "placeholder_gloss",
-        "placeholder_example",
-        "suspected_participle",
-        "short_or_metadata_gloss",
-    }
-    return not (set(flags) & blocking)
+    return shared_is_quality_ok(flags)
 
 
 def make_context_blank(sense: AnkiVerbSense) -> Optional[Tuple[str, str]]:
     """Return a safe blanked German example and answer, or None."""
     if sense.example_de_with_blank and "___" in sense.example_de_with_blank:
-        return sense.example_de_with_blank, sense.answer or sense.derived
+        answer = sense.answer or sense.derived
+        if sense.example_de_with_blank.count("___") == 1 and is_valid_context_answer(sense, answer):
+            return sense.example_de_with_blank, answer
+        return None
     if not sense.example_de:
         return None
     for answer in blanking_candidates(sense):
         answer = (answer or "").strip()
-        if not answer:
+        if not answer or not is_valid_context_answer(sense, answer):
             continue
-        pattern = re.compile(rf"\b{re.escape(answer)}\b", flags=re.IGNORECASE)
+        pattern = re.compile(rf"(?<!\w){re.escape(answer)}(?!\w)", flags=re.IGNORECASE)
         if pattern.search(sense.example_de):
             return pattern.sub("___", sense.example_de, count=1), answer
+    prefix_plain = sense.prefix.rstrip("-")
+    if sense.separability == "separable" and prefix_plain and is_valid_context_answer(sense, prefix_plain):
+        token_pattern = re.compile(rf"(?<!\w){re.escape(prefix_plain)}(?!\w)", flags=re.IGNORECASE)
+        if token_pattern.search(sense.example_de):
+            return token_pattern.sub("___", sense.example_de, count=1), prefix_plain
     return None
 
 
@@ -259,15 +232,32 @@ def make_prefix_blank(sense: AnkiVerbSense) -> Optional[Tuple[str, str]]:
     prefix_plain = sense.prefix.rstrip("-")
     if not prefix_plain or not sense.example_de:
         return None
+
+    if sense.separability == "separable":
+        token_pattern = re.compile(rf"(?<!\w){re.escape(prefix_plain)}(?!\w)", flags=re.IGNORECASE)
+        if token_pattern.search(sense.example_de):
+            return token_pattern.sub("___", sense.example_de, count=1), prefix_plain
+
     for answer in blanking_candidates(sense):
         answer = (answer or "").strip()
         if not answer.lower().startswith(prefix_plain.lower()):
             continue
         blanked_answer = "___" + answer[len(prefix_plain) :]
-        pattern = re.compile(rf"\b{re.escape(answer)}\b", flags=re.IGNORECASE)
+        pattern = re.compile(rf"(?<!\w){re.escape(answer)}(?!\w)", flags=re.IGNORECASE)
         if pattern.search(sense.example_de):
-            return pattern.sub(blanked_answer, sense.example_de, count=1), answer
+            return pattern.sub(blanked_answer, sense.example_de, count=1), prefix_plain
     return None
+
+
+def is_valid_context_answer(sense: AnkiVerbSense, answer: str) -> bool:
+    return is_valid_verbal_answer(
+        answer=answer,
+        derived=sense.derived,
+        base=sense.base,
+        prefix=sense.prefix,
+        participle_ii=sense.participle_ii,
+        present_3sg=sense.present_3sg,
+    )
 
 
 def blanking_candidates(sense: AnkiVerbSense) -> List[str]:
@@ -338,6 +328,9 @@ def generate_context_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
             front=front,
             back=back,
             tags=build_tags(sense, "context"),
+            answer=answer,
+            source_derived=sense.derived,
+            source_sense_id=sense.sense_id,
         )
     ]
 
@@ -359,12 +352,15 @@ def generate_prefix_cloze_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
             front=front,
             back=back,
             tags=build_tags(sense, "prefix_cloze"),
+            answer=answer,
+            source_derived=sense.derived,
+            source_sense_id=sense.sense_id,
         )
     ]
 
 
 def generate_construction_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
-    if not sense.construction:
+    if not is_useful_construction(sense):
         return []
     prompt = sense.construction_es or sense.gloss_es
     front = f'¿Qué construcción alemana corresponde a "{escape(prompt)}"?<br><br>Verbo: {escape(sense.derived)}'
@@ -376,8 +372,20 @@ def generate_construction_cards(sense: AnkiVerbSense) -> List[AnkiCard]:
             front=front,
             back=back,
             tags=build_tags(sense, "construction"),
+            answer=sense.construction,
+            source_derived=sense.derived,
+            source_sense_id=sense.sense_id,
         )
     ]
+
+
+def is_useful_construction(sense: AnkiVerbSense) -> bool:
+    return is_useful_construction_data(
+        construction=sense.construction,
+        derived=sense.derived,
+        base=sense.base,
+        prefix=sense.prefix,
+    )
 
 
 def generate_separability_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCard]:
@@ -387,9 +395,15 @@ def generate_separability_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCar
         by_derived.setdefault(sense.derived, sense)
 
     for sense in by_derived.values():
-        present = sense.separable_sentence_pattern or sense.present_3sg
+        present = build_present_phrase(sense)
         perfect = build_perfect_phrase(sense)
-        if not present or not perfect or sense.separability not in {"separable", "inseparable"}:
+        if (
+            not present
+            or not perfect
+            or sense.separability not in {"separable", "inseparable"}
+            or contains_bad_generated_phrase(present)
+            or contains_bad_generated_phrase(perfect)
+        ):
             continue
         answer = "Sí." if sense.separability == "separable" else "No."
         front = f"¿Es separable?<br><br>{escape(sense.derived)}"
@@ -401,16 +415,54 @@ def generate_separability_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCar
                 front=front,
                 back=back,
                 tags=build_tags(sense, "separability"),
+                answer=sense.separability,
+                source_derived=sense.derived,
+                source_sense_id=sense.sense_id,
             )
         )
     return cards
 
 
+AUX_3SG = {
+    "haben": "hat",
+    "sein": "ist",
+    "hat": "hat",
+    "ist": "ist",
+}
+
+
+def build_present_phrase(sense: AnkiVerbSense) -> str:
+    if sense.present_example_de:
+        return sense.present_example_de
+    if not sense.present_3sg:
+        return ""
+    present = sense.present_3sg.strip()
+    if " " in present:
+        parts = present.split()
+        if sense.takes_accusative is True and len(parts) > 1:
+            return f"Er {parts[0]} es {' '.join(parts[1:])}."
+        return f"Er {present}."
+    if sense.takes_accusative is True:
+        return f"Er {present} es."
+    return f"Er {present}."
+
+
 def build_perfect_phrase(sense: AnkiVerbSense) -> str:
+    if sense.perfect_example_de:
+        return sense.perfect_example_de
     if not sense.participle_ii:
         return ""
-    auxiliary = sense.perfect_auxiliary or "hat"
-    return f"Er {auxiliary} es {sense.participle_ii}."
+    aux = AUX_3SG.get((sense.perfect_auxiliary or "").lower())
+    if not aux:
+        return ""
+    if sense.takes_accusative is True and aux == "hat":
+        return f"Er hat es {sense.participle_ii}."
+    return f"Er {aux} {sense.participle_ii}."
+
+
+def contains_bad_generated_phrase(text: str) -> bool:
+    lowered = strip_html(text).lower()
+    return any(bad in lowered for bad in ("er haben", "er sein", "subject", "subjekt +", "..."))
 
 
 def generate_contrast_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCard]:
@@ -420,26 +472,54 @@ def generate_contrast_cards(senses: Sequence[AnkiVerbSense]) -> List[AnkiCard]:
         grouped.setdefault(sense.base, []).append(sense)
 
     for base, group in grouped.items():
-        selected = select_contrast_senses(group)
-        if len(selected) < 3:
+        good = [sense for sense in group if make_context_blank(sense) and (sense.gloss_es or sense.gloss_en or sense.gloss_de)]
+        if len(good) < 3:
             continue
-        front_lines = [f"Familia: {escape(base)}", "", "Elige el verbo correcto:"]
-        back_lines: List[str] = []
-        for index, sense in enumerate(selected, start=1):
-            front_lines.append(f"{index}. {escape(sense.gloss_es or sense.gloss_en or sense.gloss_de)}")
-            answer = sense.construction or sense.derived
-            back_lines.append(f"{index}. {escape(answer)}")
-        exemplar = selected[0]
-        cards.append(
-            AnkiCard(
-                cardtype="contrast",
-                key=f"contrast:{base}:{','.join(s.derived for s in selected)}",
-                front="<br>".join(front_lines),
-                back="<br>".join(back_lines),
-                tags=build_tags(exemplar, "contrast"),
+        for target in good:
+            blank = make_context_blank(target)
+            if not blank:
+                continue
+            front_example, _answer = blank
+            distractors = choose_contrast_distractors(target, good)
+            if len(distractors) < 2:
+                continue
+            options = deterministic_option_order(
+                [target.derived] + [item.derived for item in distractors],
+                f"{base}:{target.derived}:{target.sense_id}",
             )
-        )
+            front = (
+                f"Elige: {' / '.join(escape(option) for option in options)}"
+                f"<br><br>{escape(front_example)}"
+            )
+            back = (
+                f"{escape(target.derived)}<br>"
+                f"{escape(target.example_de)}<br>"
+                f"{escape(target.derived)} = {escape(target.gloss_es or target.gloss_en or target.gloss_de)}"
+            )
+            if target.construction:
+                back += f"<br>Construcción: {escape(target.construction)}"
+            cards.append(
+                AnkiCard(
+                    cardtype="contrast",
+                    key=f"contrast:{base}:{target.derived}:{target.sense_id}",
+                    front=front,
+                    back=back,
+                    tags=build_tags(target, "contrast"),
+                    answer=target.derived,
+                    source_derived=target.derived,
+                    source_sense_id=target.sense_id,
+                )
+            )
     return cards
+
+
+def choose_contrast_distractors(target: AnkiVerbSense, group: Sequence[AnkiVerbSense]) -> List[AnkiVerbSense]:
+    candidates = [sense for sense in group if sense.derived != target.derived]
+    return sorted(candidates, key=lambda sense: stable_guid(f"{target.derived}:{sense.derived}"))[:3]
+
+
+def deterministic_option_order(options: Sequence[str], salt: str) -> List[str]:
+    return sorted(dict.fromkeys(options), key=lambda option: stable_guid(f"{salt}:{option}"))
 
 
 def select_contrast_senses(group: Sequence[AnkiVerbSense]) -> List[AnkiVerbSense]:
@@ -507,22 +587,67 @@ def escape(value: Any) -> str:
     return html.escape(str(value or ""), quote=False)
 
 
-def validate_cards(cards: Sequence[AnkiCard]) -> List[str]:
+def strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", " ", str(text or ""))
+
+
+def validate_senses_for_card_generation(senses: Sequence[AnkiVerbSense], *, strict: bool = False) -> List[str]:
+    errors: List[str] = []
+    for sense in senses:
+        if strict and not sense.is_quality_ok:
+            errors.append(f"{sense.derived}/{sense.sense_id}: low-quality sense: {', '.join(sense.quality_flags)}")
+        if sense.is_quality_ok:
+            missing = [
+                field
+                for field in (
+                    "example_de_with_blank",
+                    "answer",
+                    "construction",
+                    "present_3sg",
+                    "perfect_auxiliary",
+                    "participle_ii",
+                )
+                if not getattr(sense, field)
+            ]
+            for field in missing:
+                errors.append(f"{sense.derived}/{sense.sense_id}: quality-ok sense missing {field}")
+            if not is_valid_context_answer(sense, sense.answer):
+                errors.append(f"{sense.derived}/{sense.sense_id}: invalid context answer {sense.answer!r}")
+    return errors
+
+
+def validate_cards(cards: Sequence[AnkiCard], *, strict: bool = False) -> List[str]:
     errors: List[str] = []
     seen: set[Tuple[str, str]] = set()
     for card in cards:
+        lower_text = strip_html(f"{card.front} {card.back}").lower()
         if not card.front.strip():
             errors.append(f"{card.key}: empty front")
         if not card.back.strip():
             errors.append(f"{card.key}: empty back")
-        if card.cardtype == "context" and "___" not in card.front:
-            errors.append(f"{card.key}: context card has no blank")
+        if card.cardtype in {"context", "prefix_cloze", "contrast"}:
+            if "___" not in card.front:
+                errors.append(f"{card.key}: {card.cardtype} card has no blank")
+            if not card.answer:
+                errors.append(f"{card.key}: {card.cardtype} card has no answer")
+        if card.cardtype == "prefix_cloze" and len(card.answer.split()) > 1:
+            errors.append(f"{card.key}: prefix_cloze answer should be prefix token")
+        if card.cardtype == "separability":
+            if "er haben" in lower_text or "er sein" in lower_text:
+                errors.append(f"{card.key}: malformed perfect auxiliary")
+            if "subject" in lower_text or "subjekt +" in lower_text:
+                errors.append(f"{card.key}: pseudo-pattern leaked into separability card")
+        if card.cardtype == "construction":
+            if "subject +" in lower_text or "subjekt + verb + objekt" in lower_text:
+                errors.append(f"{card.key}: generic construction card")
         if not card.tags:
             errors.append(f"{card.key}: missing tags")
         dup_key = (card.key, card.cardtype)
         if dup_key in seen:
             errors.append(f"{card.key}: duplicate card")
         seen.add(dup_key)
+    if strict and not cards:
+        errors.append("strict validation: no cards generated")
     return errors
 
 
@@ -605,6 +730,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--format", choices=["apkg", "csv"], default="apkg")
     parser.add_argument("--include-low-quality", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--strict", action="store_true", help="Fail validation on low-quality senses or malformed cards.")
     return parser.parse_args(argv)
 
 
@@ -613,7 +739,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         senses = load_input(args.input)
         cards = generate_cards(senses, include_low_quality=args.include_low_quality)
-        errors = validate_cards(cards)
+        errors = validate_senses_for_card_generation(senses, strict=args.strict)
+        errors.extend(validate_cards(cards, strict=args.strict))
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
