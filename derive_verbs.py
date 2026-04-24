@@ -1,8 +1,9 @@
-"""Utilities to derive German verb compounds from Wiktionary entries.
+"""Derive and enrich German prefixed verbs from Wiktionary.
 
-This module provides a command line interface that accepts a list of German
-verbs and scrapes https://de.wiktionary.org to discover prefixed compounds.
-The output is written both as CSV and JSON files with fixed schemas.
+The command line interface accepts German base verbs, discovers prefixed
+compounds on German Wiktionary, and writes enriched CSV/JSON output that can be
+fed into ``build_anki_deck.py``. The writer keeps the old flat fields such as
+``example`` while adding sense-aware fields for deck generation.
 """
 
 from __future__ import annotations
@@ -13,16 +14,16 @@ import json
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import quote, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup, Tag
 
 BASE_URL_TEMPLATE = "https://de.wiktionary.org/wiki/{}"
-# Prefix definitions without trailing hyphen to simplify matching.
+
 SEPARABLE_PREFIXES: Dict[str, str] = {
     "ab": "ab-",
     "an": "an-",
@@ -49,11 +50,11 @@ INSEPARABLE_PREFIXES: Dict[str, str] = {
     "emp": "emp-",
     "ent": "ent-",
     "er": "er-",
-    "ge": "ge-",
     "miss": "miss-",
     "ver": "ver-",
     "zer": "zer-",
 }
+GE_PREFIX: Dict[str, str] = {"ge": "ge-"}
 AMBIGUOUS_PREFIXES: Dict[str, str] = {
     "durch": "durch-",
     "hinter": "hinter-",
@@ -63,20 +64,10 @@ AMBIGUOUS_PREFIXES: Dict[str, str] = {
     "wider": "wider-",
 }
 
-# Build a single ordered list of (prefix_str, label_with_dash, separability)
-PREFIX_ORDER: Sequence[Tuple[str, str, str]] = tuple(
-    sorted(
-        list((p, lbl, "separable") for p, lbl in SEPARABLE_PREFIXES.items())
-        + list((p, lbl, "inseparable") for p, lbl in INSEPARABLE_PREFIXES.items())
-        + list((p, lbl, "ambiguous") for p, lbl in AMBIGUOUS_PREFIXES.items()),
-        key=lambda item: len(item[0]),
-        reverse=True,  # longest prefix first
-    )
-)
-
 CSV_HEADERS = [
     "base",
     "derived",
+    "sense_id",
     "prefix",
     "separability",
     "pos",
@@ -84,11 +75,45 @@ CSV_HEADERS = [
     "gloss_es",
     "gloss_en",
     "example",
+    "example_de",
+    "example_es",
+    "example_en",
+    "example_de_with_blank",
+    "answer",
+    "construction",
+    "construction_es",
+    "register",
+    "difficulty",
+    "frequency_bucket",
+    "is_reflexive",
+    "takes_accusative",
+    "takes_dative",
+    "fixed_preposition",
+    "present_3sg",
+    "perfect_auxiliary",
+    "participle_ii",
+    "separable_sentence_pattern",
+    "is_quality_ok",
+    "quality_flags",
+    "anki_hint_es",
     "wiktionary_url",
+    "source",
 ]
 
 NON_LEMMA_TITLE_KEYWORDS = ("konjugation", "partizip", "partizip ii")
 TARGET_TRANSLATION_LANGUAGES = {"englisch", "spanisch"}
+PLACEHOLDER_PATTERNS = (
+    "dieser abschnitt fehlt",
+    "hilf mit",
+    "wiktionary zu vervollständigen",
+    "bedeutungen fehlen",
+    "noch keine bedeutung",
+)
+METADATA_GLOSS_PATTERNS = (
+    "anmerkung: duden online",
+    "duden online",
+    "referenzen und weiterführende informationen",
+)
 METADATA_LABELS = {
     "worttrennung",
     "aussprache",
@@ -121,6 +146,15 @@ FLEXION_KEYWORDS = (
     "hörbeispiel",
     "hörbeispiele",
 )
+BLOCKING_QUALITY_FLAGS = {
+    "missing_gloss_de",
+    "missing_gloss_es",
+    "missing_example_de",
+    "placeholder_gloss",
+    "placeholder_example",
+    "suspected_participle",
+    "short_or_metadata_gloss",
+}
 
 
 @dataclass
@@ -132,6 +166,37 @@ class PageContent:
 
 
 @dataclass
+class VerbSense:
+    """One learner-oriented sense for a prefixed verb."""
+
+    sense_id: int = 1
+    gloss_de: str = ""
+    gloss_es: str = ""
+    gloss_en: str = ""
+    example_de: str = ""
+    example_es: str = ""
+    example_en: str = ""
+    example_de_with_blank: str = ""
+    answer: str = ""
+    construction: str = ""
+    construction_es: str = ""
+    register: str = "unknown"
+    difficulty: str = "unknown"
+    frequency_bucket: str = "unknown"
+    is_reflexive: bool = False
+    takes_accusative: Optional[bool] = None
+    takes_dative: Optional[bool] = None
+    fixed_preposition: str = ""
+    present_3sg: str = ""
+    perfect_auxiliary: str = ""
+    participle_ii: str = ""
+    separable_sentence_pattern: str = ""
+    is_quality_ok: bool = True
+    quality_flags: List[str] = field(default_factory=list)
+    anki_hint_es: str = ""
+
+
+@dataclass
 class DerivedVerb:
     """Structured representation of a derived German verb."""
 
@@ -140,11 +205,29 @@ class DerivedVerb:
     prefix: str
     separability: str
     pos: str
-    gloss_de: str
-    gloss_es: str
-    gloss_en: str
-    example: str
+    senses: List[VerbSense]
     wiktionary_url: str
+    source: str = "wiktionary"
+
+    @property
+    def primary_sense(self) -> VerbSense:
+        return self.senses[0] if self.senses else VerbSense()
+
+    @property
+    def gloss_de(self) -> str:
+        return self.primary_sense.gloss_de
+
+    @property
+    def gloss_es(self) -> str:
+        return self.primary_sense.gloss_es
+
+    @property
+    def gloss_en(self) -> str:
+        return self.primary_sense.gloss_en
+
+    @property
+    def example(self) -> str:
+        return self.primary_sense.example_de
 
 
 class WiktionaryClient:
@@ -155,7 +238,7 @@ class WiktionaryClient:
         max_retries: int = 3,
         backoff_factor: float = 0.8,
         min_interval: float = 0.7,
-        user_agent: str = "verb-praefixe-collector/0.1 (+https://example.org)",
+        user_agent: str = "verb-praefixe-collector/0.2 (+https://example.org)",
     ) -> None:
         self.session = requests.Session()
         self.max_retries = max_retries
@@ -196,8 +279,6 @@ class WiktionaryClient:
             if response.status_code >= 500 or response.status_code == 429:
                 self._sleep_backoff(attempt)
                 continue
-
-            # Other HTTP errors → abort
             break
 
         self.cache[cache_key] = None
@@ -216,14 +297,24 @@ class WiktionaryClient:
         time.sleep(sleep_for)
 
 
+def prefix_order(include_ge_prefix: bool = False) -> Sequence[Tuple[str, str, str]]:
+    """Return prefix match order, optionally including ge-."""
+    inseparable = dict(INSEPARABLE_PREFIXES)
+    if include_ge_prefix:
+        inseparable.update(GE_PREFIX)
+    return tuple(
+        sorted(
+            list((p, lbl, "separable") for p, lbl in SEPARABLE_PREFIXES.items())
+            + list((p, lbl, "inseparable") for p, lbl in inseparable.items())
+            + list((p, lbl, "ambiguous") for p, lbl in AMBIGUOUS_PREFIXES.items()),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+    )
+
+
 def find_verb_anchor(german_nodes: Sequence[object]) -> Optional[Tag]:
-    """
-    Return an anchor (heading tag) that marks the start of the Verb entry.
-    Wiktionary DE often has a 'Wortart' heading with the word 'Verb' in the
-    following paragraph/table. We accept either:
-      - a heading with id/text 'Verb', OR
-      - a heading containing 'Wortart' when the immediate block mentions 'Verb'.
-    """
+    """Return a heading tag that marks the start of the Verb entry."""
     direct = find_heading(german_nodes, ("Verb",))
     if direct:
         return direct
@@ -247,7 +338,6 @@ def find_verb_anchor(german_nodes: Sequence[object]) -> Optional[Tag]:
             window_text = " ".join(clean_text(x) for x in window if isinstance(x, Tag)).lower()
             if "verb" in window_text:
                 return heading_tag
-
     return None
 
 
@@ -260,6 +350,7 @@ def derive_for_bases(
     bases: Iterable[str],
     *,
     client: Optional[WiktionaryClient] = None,
+    include_ge_prefix: bool = False,
 ) -> List[DerivedVerb]:
     """Collect derived verbs for a list of base verbs."""
     wiktionary = client or WiktionaryClient()
@@ -278,25 +369,23 @@ def derive_for_bases(
             print(f"  warning: missing 'Deutsch' section for '{base}'.")
             continue
 
-        candidates = extract_candidate_lemmas_anywhere(german_section, base)
+        candidates = extract_candidate_lemmas_anywhere(german_section, base, include_ge_prefix=include_ge_prefix)
         print(f"  found {len(candidates)} raw candidates for '{base}'.")
 
         if not candidates:
-            wide = extract_candidate_lemmas_anywhere(base_page.soup, base)
+            wide = extract_candidate_lemmas_anywhere(base_page.soup, base, include_ge_prefix=include_ge_prefix)
             print(f"  fallback(anywhere): +{len(wide)} candidates for '{base}'.")
             candidates |= wide
 
         seen: Set[str] = set()
-
         for candidate in sorted(candidates):
-            prefix_info = identify_prefix(candidate, base)
+            prefix_info = identify_prefix(candidate, base, include_ge_prefix=include_ge_prefix)
             if not prefix_info:
                 continue
 
             prefix_label, separability = prefix_info
             if separability == "ambiguous":
                 continue
-
             if candidate in seen:
                 continue
 
@@ -339,8 +428,13 @@ def looks_like_non_lemma_title(title: str) -> bool:
     return any(keyword in title for keyword in NON_LEMMA_TITLE_KEYWORDS)
 
 
-def extract_candidate_lemmas_anywhere(section: Union[BeautifulSoup, Sequence[object]], base: str) -> Set[str]:
-    """Collect candidate lemmas by scanning the given German section (or whole page)."""
+def extract_candidate_lemmas_anywhere(
+    section: Union[BeautifulSoup, Sequence[object]],
+    base: str,
+    *,
+    include_ge_prefix: bool = False,
+) -> Set[str]:
+    """Collect candidate lemmas by scanning the given German section or page."""
     candidates: Set[str] = set()
 
     for anchor in iter_anchor_tags(section):
@@ -351,7 +445,7 @@ def extract_candidate_lemmas_anywhere(section: Union[BeautifulSoup, Sequence[obj
         lower = lemma.lower()
         if "_" in lower or len(lower) <= len(base):
             continue
-        if identify_prefix(lower, base):
+        if identify_prefix(lower, base, include_ge_prefix=include_ge_prefix):
             candidates.add(lower)
 
     return candidates
@@ -388,18 +482,13 @@ def normalize_lemma_from_href(href: str) -> Optional[str]:
     target = path.split("/wiki/", 1)[1]
     target = target.split("?", 1)[0]
     target = target.split("#", 1)[0]
-    if ":" in target:  # skip namespaces
+    if ":" in target:
         return None
     return unquote(target).strip()
 
 
 def extract_deutsch_section(soup: BeautifulSoup) -> List[object]:
-    """Return nodes within the German section of a Wiktionary page.
-
-    More robust: accept ids like 'Deutsch', 'Deutsch_(1)', etc.
-    Fallback: return whole document children if not found.
-    """
-    # try: any h2/span whose id starts with 'Deutsch'
+    """Return nodes within the German section of a Wiktionary page."""
     for h2 in soup.find_all("h2"):
         span_ids = [span.get("id", "") for span in h2.find_all("span", id=True) if span.get("id")]
         heading_text = h2.get_text(strip=True).lower()
@@ -411,7 +500,6 @@ def extract_deutsch_section(soup: BeautifulSoup) -> List[object]:
             container: Tag = h2.parent if isinstance(h2.parent, Tag) else h2
             for sibling in container.next_siblings:
                 if isinstance(sibling, Tag):
-                    # stop when the next language heading (wrapped in mw-heading2) starts
                     classes = sibling.get("class", [])
                     if sibling.name == "div" and classes and "mw-heading2" in classes:
                         break
@@ -433,14 +521,17 @@ def extract_deutsch_section(soup: BeautifulSoup) -> List[object]:
 
             return list(flatten(nodes))
 
-    # fallback — better to keep working than to drop everything
     return list(soup.body.children) if soup.body else list(soup.children)
 
 
-def identify_prefix(lemma: str, base: str) -> Optional[Tuple[str, str]]:
+def identify_prefix(
+    lemma: str,
+    base: str,
+    *,
+    include_ge_prefix: bool = False,
+) -> Optional[Tuple[str, str]]:
     """Identify prefix label and separability for a derived lemma."""
-    # Check the longest matching prefix first.
-    for prefix, label, separability in PREFIX_ORDER:
+    for prefix, label, separability in prefix_order(include_ge_prefix=include_ge_prefix):
         if lemma.startswith(prefix):
             remainder = lemma[len(prefix) :]
             if remainder == base:
@@ -455,7 +546,7 @@ def extract_verb_entry(
     separability: str,
     page: PageContent,
 ) -> Optional[DerivedVerb]:
-    """Extract relevant information from a derived verb page (robust on DE Wiktionary)."""
+    """Extract relevant information from a derived verb page."""
     german_nodes = extract_deutsch_section(page.soup)
     if not german_nodes:
         return None
@@ -471,34 +562,48 @@ def extract_verb_entry(
     if not translations:
         translations = extract_translations_from_nodes(german_nodes)
 
+    raw_example = extract_example(scan_nodes)
+    sense = VerbSense(
+        sense_id=1,
+        gloss_de=gloss_de,
+        gloss_es=translations.get("spanisch", ""),
+        gloss_en=translations.get("englisch", ""),
+        example_de=normalize_example(raw_example),
+    )
+    sense.quality_flags = detect_quality_flags(
+        {
+            "base": base,
+            "derived": derived,
+            "prefix": prefix_label,
+            "gloss_de": sense.gloss_de,
+            "gloss_es": sense.gloss_es,
+            "gloss_en": sense.gloss_en,
+            "example_de": sense.example_de,
+            "register": sense.register,
+        }
+    )
+    sense.is_quality_ok = is_quality_ok(sense.quality_flags)
+
     return DerivedVerb(
         base=base,
         derived=derived,
         prefix=prefix_label,
         separability=separability,
-        pos="Verb",  # we anchored on/near Wortart: Verb (or we had good DE gloss)
-        gloss_de=gloss_de,
-        gloss_es=translations.get("spanisch", ""),
-        gloss_en=translations.get("englisch", ""),
-        example=extract_example(scan_nodes),
+        pos="Verb",
+        senses=[sense],
         wiktionary_url=page.url,
+        source="wiktionary",
     )
 
 
-def entry_scan_nodes(
-    anchor: Optional[Tag],
-    fallback_nodes: Sequence[object],
-) -> List[object]:
+def entry_scan_nodes(anchor: Optional[Tag], fallback_nodes: Sequence[object]) -> List[object]:
     """Return the section nodes to inspect for one verb entry."""
     if anchor is None:
         return list(fallback_nodes)
     return list(iterate_section_after_heading(anchor))
 
 
-def find_heading(
-    section_nodes: Sequence[object],
-    ids_or_titles: Tuple[str, ...],
-) -> Optional[Tag]:
+def find_heading(section_nodes: Sequence[object], ids_or_titles: Tuple[str, ...]) -> Optional[Tag]:
     """Find the first heading matching one of the provided labels."""
     normalized_targets = tuple(item.lower() for item in ids_or_titles)
     for node in section_nodes:
@@ -565,7 +670,6 @@ def extract_labeled_block_text(nodes: Sequence[object], label: str) -> str:
             text = _first_text_after_marker(nodes[index + 1 :])
             if text:
                 return text
-
     return ""
 
 
@@ -589,9 +693,165 @@ def is_content_text(text: str) -> bool:
 def extract_example(nodes: Sequence[object]) -> str:
     """Retrieve one example sentence if available."""
     example = extract_labeled_block_text(nodes, "beispiel")
-    if example:
-        return example
-    return ""
+    return example if example else ""
+
+
+def normalize_example(text: str) -> str:
+    """Clean a German example while preserving sentence text."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"\[\d+\]", "", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"^Beispiele?:\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip(" \t\r\n\"'“”„‚‘")
+    cleaned = re.sub(r"\s+\((?:Quelle|siehe|vergleiche|vgl\.).*?\)\s*$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def detect_quality_flags(row: Union[DerivedVerb, VerbSense, Dict[str, Any]]) -> List[str]:
+    """Infer quality flags for a flat row, verb, or sense."""
+    data = row_to_quality_dict(row)
+    flags: List[str] = []
+    gloss_de = str(data.get("gloss_de") or "").strip()
+    gloss_es = str(data.get("gloss_es") or "").strip()
+    gloss_en = str(data.get("gloss_en") or "").strip()
+    example_de = str(data.get("example_de") or data.get("example") or "").strip()
+    derived = str(data.get("derived") or "").strip().lower()
+    prefix = str(data.get("prefix") or "").strip().lower()
+    register = str(data.get("register") or "").strip().lower()
+
+    if not gloss_de:
+        flags.append("missing_gloss_de")
+    if not gloss_es:
+        flags.append("missing_gloss_es")
+    if not gloss_en:
+        flags.append("missing_gloss_en")
+    if not example_de:
+        flags.append("missing_example_de")
+
+    lowered_gloss = gloss_de.lower()
+    lowered_example = example_de.lower()
+    if any(pattern in lowered_gloss for pattern in PLACEHOLDER_PATTERNS):
+        flags.append("placeholder_gloss")
+    if any(pattern in lowered_example for pattern in PLACEHOLDER_PATTERNS):
+        flags.append("placeholder_example")
+    if prefix == "ge-" or (derived.startswith("ge") and data.get("base")):
+        flags.append("suspected_participle")
+    if gloss_de and (len(gloss_de) < 8 or any(pattern in lowered_gloss for pattern in METADATA_GLOSS_PATTERNS)):
+        flags.append("short_or_metadata_gloss")
+    if example_de and len(example_de.split()) > 25:
+        flags.append("long_example")
+    if register in {"rare", "archaic", "domain-specific"}:
+        flags.append("rare_or_domain_specific")
+
+    return sorted(dict.fromkeys(flags))
+
+
+def row_to_quality_dict(row: Union[DerivedVerb, VerbSense, Dict[str, Any]]) -> Dict[str, Any]:
+    """Flatten supported row objects into a dictionary for flag detection."""
+    if isinstance(row, DerivedVerb):
+        sense = row.primary_sense
+        return {
+            "base": row.base,
+            "derived": row.derived,
+            "prefix": row.prefix,
+            "gloss_de": sense.gloss_de,
+            "gloss_es": sense.gloss_es,
+            "gloss_en": sense.gloss_en,
+            "example_de": sense.example_de,
+            "register": sense.register,
+        }
+    if isinstance(row, VerbSense):
+        return asdict(row)
+    return dict(row)
+
+
+def is_quality_ok(flags: Sequence[str]) -> bool:
+    """Return whether a row is safe for default Anki generation."""
+    return not (set(flags) & BLOCKING_QUALITY_FLAGS)
+
+
+def needs_openai_enrichment(verb: DerivedVerb) -> bool:
+    """Return whether a verb has thin enough data to ask OpenAI for help."""
+    for sense in verb.senses:
+        flags = set(sense.quality_flags)
+        if (
+            not sense.gloss_es
+            or not sense.gloss_en
+            or not sense.example_de
+            or "placeholder_gloss" in flags
+            or "short_or_metadata_gloss" in flags
+        ):
+            return True
+    return False
+
+
+def apply_enrichment_payload(verb: DerivedVerb, payload: Dict[str, Any]) -> DerivedVerb:
+    """Return a copy-like enriched verb using an OpenAI payload."""
+    raw_senses = payload.get("senses") if isinstance(payload, dict) else None
+    if not isinstance(raw_senses, list) or not raw_senses:
+        for sense in verb.senses:
+            if "openai_enrichment_failed" not in sense.quality_flags:
+                sense.quality_flags.append("openai_enrichment_failed")
+            sense.is_quality_ok = is_quality_ok(sense.quality_flags)
+        return verb
+
+    enriched_senses: List[VerbSense] = []
+    for index, raw in enumerate(raw_senses, start=1):
+        if not isinstance(raw, dict):
+            continue
+        sense = VerbSense(
+            sense_id=int(raw.get("sense_id") or index),
+            gloss_de=str(raw.get("gloss_de_simple") or raw.get("gloss_de") or verb.gloss_de or ""),
+            gloss_es=str(raw.get("gloss_es") or verb.gloss_es or ""),
+            gloss_en=str(raw.get("gloss_en") or verb.gloss_en or ""),
+            example_de=normalize_example(str(raw.get("example_de") or verb.example or "")),
+            example_es=str(raw.get("example_es") or ""),
+            example_en=str(raw.get("example_en") or ""),
+            example_de_with_blank=str(raw.get("example_de_with_blank") or ""),
+            answer=str(raw.get("answer") or verb.derived),
+            construction=str(raw.get("construction") or ""),
+            construction_es=str(raw.get("construction_es") or ""),
+            register=str(raw.get("register") or "unknown"),
+            difficulty=str(raw.get("difficulty") or "unknown"),
+            frequency_bucket=str(raw.get("frequency_bucket") or "unknown"),
+            is_reflexive=bool(raw.get("is_reflexive", False)),
+            takes_accusative=parse_optional_bool(raw.get("takes_accusative")),
+            takes_dative=parse_optional_bool(raw.get("takes_dative")),
+            fixed_preposition=str(raw.get("fixed_preposition") or ""),
+            present_3sg=str(raw.get("present_3sg") or ""),
+            perfect_auxiliary=str(raw.get("perfect_auxiliary") or ""),
+            participle_ii=str(raw.get("participle_ii") or ""),
+            separable_sentence_pattern=str(raw.get("separable_sentence_pattern") or ""),
+            anki_hint_es=str(raw.get("anki_hint_es") or raw.get("gloss_es") or ""),
+        )
+        model_flags = raw.get("quality_flags") if isinstance(raw.get("quality_flags"), list) else []
+        sense.quality_flags = sorted(
+            dict.fromkeys([str(flag) for flag in model_flags] + detect_quality_flags({**asdict(sense), "derived": verb.derived, "base": verb.base, "prefix": verb.prefix}))
+        )
+        if raw.get("suitable_for_anki") is False and "openai_marked_unsuitable" not in sense.quality_flags:
+            sense.quality_flags.append("openai_marked_unsuitable")
+        sense.is_quality_ok = is_quality_ok(sense.quality_flags) and raw.get("suitable_for_anki", True) is not False
+        enriched_senses.append(sense)
+
+    if enriched_senses:
+        verb.senses = enriched_senses
+        verb.source = "wiktionary+openai" if verb.wiktionary_url else "openai"
+    return verb
+
+
+def parse_optional_bool(value: Any) -> Optional[bool]:
+    """Parse bool-like values while preserving unknown/null."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"true", "1", "yes", "ja"}:
+        return True
+    if lowered in {"false", "0", "no", "nein"}:
+        return False
+    return None
 
 
 def _first_text_in_block(heading: Tag) -> str:
@@ -647,13 +907,9 @@ def extract_translations_from_nodes(nodes: Sequence[object]) -> Dict[str, str]:
                 return collected
 
         if node.name == "p" and "übersetz" in clean_text(node).lower():
-            merge_translations(
-                collected,
-                _parse_translation_tables_after_marker(node_list[index + 1 :]),
-            )
+            merge_translations(collected, _parse_translation_tables_after_marker(node_list[index + 1 :]))
             if collected:
                 return collected
-
     return collected
 
 
@@ -676,7 +932,7 @@ def _parse_translation_tables(heading: Tag) -> Dict[str, str]:
 
 
 def _parse_translation_tables_after_marker(nodes: Sequence[object]) -> Dict[str, str]:
-    """Parse translation tables after a paragraph marker such as 'Übersetzungen:'."""
+    """Parse translation tables after a paragraph marker such as Übersetzungen."""
     collected: Dict[str, str] = {}
     for node in nodes:
         if not isinstance(node, Tag):
@@ -722,12 +978,11 @@ def _extract_translation_from_list_item(item: Tag) -> Optional[Tuple[str, str]]:
     values = [clean_text(span) for span in item.find_all("span", lang=True) if clean_text(span)]
     if not values:
         return language, ""
-
     return language, ", ".join(dict.fromkeys(values))
 
 
 def _extract_heading_tag(node: Tag, levels: Sequence[str] = ("h3", "h4", "h5")) -> Optional[Tag]:
-    """Return the first heading tag within a container matching the desired levels."""
+    """Return the first heading tag within a container matching desired levels."""
     if node.name in levels:
         return node
 
@@ -806,11 +1061,55 @@ def clean_text(element: Optional[Tag]) -> str:
     return text.strip()
 
 
-def write_outputs(
-    derived_verbs: Sequence[DerivedVerb],
-    csv_path: Path,
-    json_path: Path,
-) -> None:
+def derived_verb_to_json(verb: DerivedVerb) -> Dict[str, Any]:
+    """Convert a DerivedVerb to nested JSON with legacy top-level aliases."""
+    data = {
+        "base": verb.base,
+        "derived": verb.derived,
+        "prefix": verb.prefix,
+        "separability": verb.separability,
+        "pos": verb.pos,
+        "wiktionary_url": verb.wiktionary_url,
+        "source": verb.source,
+        "senses": [asdict(sense) for sense in verb.senses],
+    }
+    first = verb.primary_sense
+    data.update(
+        {
+            "gloss_de": first.gloss_de,
+            "gloss_es": first.gloss_es,
+            "gloss_en": first.gloss_en,
+            "example": first.example_de,
+            "example_de": first.example_de,
+            "is_quality_ok": first.is_quality_ok,
+            "quality_flags": first.quality_flags,
+        }
+    )
+    return data
+
+
+def flatten_derived_verbs(derived_verbs: Sequence[DerivedVerb]) -> List[Dict[str, Any]]:
+    """Return one CSV-ready row per sense."""
+    rows: List[Dict[str, Any]] = []
+    for verb in derived_verbs:
+        for sense in verb.senses:
+            row = {
+                "base": verb.base,
+                "derived": verb.derived,
+                "prefix": verb.prefix,
+                "separability": verb.separability,
+                "pos": verb.pos,
+                "wiktionary_url": verb.wiktionary_url,
+                "source": verb.source,
+                **asdict(sense),
+            }
+            row["example"] = sense.example_de
+            row["quality_flags"] = json.dumps(sense.quality_flags, ensure_ascii=False)
+            rows.append({header: row.get(header, "") for header in CSV_HEADERS})
+    return rows
+
+
+def write_outputs(derived_verbs: Sequence[DerivedVerb], csv_path: Path, json_path: Path) -> None:
     """Persist results to CSV and JSON files."""
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -818,16 +1117,36 @@ def write_outputs(
     with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_HEADERS)
         writer.writeheader()
-        for item in derived_verbs:
-            writer.writerow(asdict(item))
+        writer.writerows(flatten_derived_verbs(derived_verbs))
 
     with json_path.open("w", encoding="utf-8") as json_file:
-        json.dump(
-            [asdict(item) for item in derived_verbs],
-            json_file,
-            ensure_ascii=False,
-            indent=2,
-        )
+        json.dump([derived_verb_to_json(item) for item in derived_verbs], json_file, ensure_ascii=False, indent=2)
+
+
+def validate_derived_verbs(derived_verbs: Sequence[DerivedVerb]) -> List[str]:
+    """Return validation errors for enriched derived verbs."""
+    errors: List[str] = []
+    seen: Set[Tuple[str, int]] = set()
+    for verb in derived_verbs:
+        if not verb.base:
+            errors.append(f"{verb.derived or '<missing>'}: missing base")
+        if not verb.derived:
+            errors.append(f"{verb.base or '<missing>'}: missing derived")
+        if verb.base and verb.derived == verb.base:
+            errors.append(f"{verb.derived}: derived equals base")
+        prefix_plain = verb.prefix.rstrip("-")
+        if prefix_plain and verb.base and verb.derived and not verb.derived.startswith(prefix_plain + verb.base):
+            errors.append(f"{verb.derived}: does not match prefix+base")
+        for sense in verb.senses:
+            key = (verb.derived, sense.sense_id)
+            if key in seen:
+                errors.append(f"{verb.derived}: duplicate sense_id {sense.sense_id}")
+            seen.add(key)
+            if not (sense.gloss_de or sense.gloss_es):
+                errors.append(f"{verb.derived}/{sense.sense_id}: missing usable gloss")
+            if "suspected_participle" in sense.quality_flags and verb.prefix != "ge-":
+                errors.append(f"{verb.derived}/{sense.sense_id}: unexpected participle flag")
+    return errors
 
 
 def load_verbs_from_args(args: argparse.Namespace) -> List[str]:
@@ -854,13 +1173,61 @@ def output_paths(out_stem: Path) -> Tuple[Path, Path]:
     return Path(f"{stem}.csv").resolve(), Path(f"{stem}.json").resolve()
 
 
+def enrich_with_openai_if_requested(args: argparse.Namespace, derived: List[DerivedVerb]) -> List[DerivedVerb]:
+    """Run OpenAI enrichment for rows that need it when requested."""
+    if not args.enrich_openai:
+        return derived
+    try:
+        from openai_enrich import OpenAIEnricher
+    except ImportError as exc:
+        print(f"warning: OpenAI enrichment unavailable: {exc}", file=sys.stderr)
+        return derived
+
+    enricher = OpenAIEnricher(
+        model=args.openai_model,
+        cache_path=args.openai_cache,
+        refresh_cache=args.refresh_openai_cache,
+    )
+    enriched: List[DerivedVerb] = []
+    calls = 0
+    for verb in derived:
+        should_call = args.force_openai or needs_openai_enrichment(verb)
+        if not should_call:
+            enriched.append(verb)
+            continue
+        if args.max_openai_rows is not None and calls >= args.max_openai_rows:
+            enriched.append(verb)
+            continue
+        payload = enricher.enrich(row_for_openai(verb))
+        calls += 1
+        enriched.append(apply_enrichment_payload(verb, payload or {}))
+    return enriched
+
+
+def row_for_openai(verb: DerivedVerb) -> Dict[str, Any]:
+    """Build the flat context row sent to OpenAI enrichment."""
+    sense = verb.primary_sense
+    return {
+        "base": verb.base,
+        "derived": verb.derived,
+        "prefix": verb.prefix,
+        "separability": verb.separability,
+        "gloss_de": sense.gloss_de,
+        "gloss_es": sense.gloss_es,
+        "gloss_en": sense.gloss_en,
+        "example_de": sense.example_de,
+        "wiktionary_url": verb.wiktionary_url,
+        "quality_flags": sense.quality_flags,
+    }
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Derive prefixed German verbs from Wiktionary.")
     parser.add_argument(
         "--verbs",
         type=str,
-        help=("Comma-separated base verbs or a path to a text file with one verb per line."),
+        help="Comma-separated base verbs or a path to a text file with one verb per line.",
         default="verbs.txt",
     )
     parser.add_argument(
@@ -869,6 +1236,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Output file stem. '.csv' and '.json' are written beside it.",
         default=Path("out"),
     )
+    parser.add_argument("--include-ge-prefix", action="store_true", help="Include lexical ge- candidates.")
+    parser.add_argument("--validate-only", action="store_true", help="Validate derived data without writing output.")
+    parser.add_argument("--enrich-openai", action="store_true", help="Use OpenAI to enrich weak rows.")
+    parser.add_argument("--force-openai", action="store_true", help="Call OpenAI for every derived verb.")
+    parser.add_argument("--openai-model", default="gpt-4.1-mini", help="OpenAI model for enrichment.")
+    parser.add_argument("--openai-cache", type=Path, default=Path(".cache/openai_enrichment.jsonl"))
+    parser.add_argument("--refresh-openai-cache", action="store_true", help="Ignore existing OpenAI cache entries.")
+    parser.add_argument("--max-openai-rows", type=int, default=None, help="Maximum rows to enrich this run.")
     return parser.parse_args(argv)
 
 
@@ -881,16 +1256,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    derived = derive_for_bases(verbs)
+    derived = derive_for_bases(verbs, include_ge_prefix=args.include_ge_prefix)
+    derived = enrich_with_openai_if_requested(args, derived)
+    validation_errors = validate_derived_verbs(derived)
+
+    if args.validate_only:
+        if validation_errors:
+            print("Validation failed:", file=sys.stderr)
+            for error in validation_errors:
+                print(f"  - {error}", file=sys.stderr)
+            return 1
+        print(f"Validation ok: {len(derived)} verbs, {sum(len(item.senses) for item in derived)} senses.")
+        return 0
 
     csv_path, json_path = output_paths(args.out)
     write_outputs(derived, csv_path, json_path)
 
+    if validation_errors:
+        print(f"Wrote outputs with {len(validation_errors)} validation warning(s).", file=sys.stderr)
+        for error in validation_errors[:20]:
+            print(f"  - {error}", file=sys.stderr)
     if derived:
-        print(f"Wrote {len(derived)} rows to {csv_path} and {json_path}.")
+        row_count = sum(len(item.senses) for item in derived)
+        print(f"Wrote {row_count} rows to {csv_path} and {json_path}.")
     else:
         print(f"No derived verbs found. Wrote empty files to {csv_path} and {json_path}.")
-
     return 0
 
 
