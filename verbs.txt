@@ -4,6 +4,7 @@ fahren
 stehen
 stellen
 setzen
+sitzen
 legen
 liegen
 fallen
